@@ -7,6 +7,8 @@ use x86_64::instructions::interrupts as cpu_interrupts;
 
 mod interrupts;
 mod keyboard;
+mod serial;
+mod shell;
 mod vga;
 
 core::arch::global_asm!(
@@ -117,59 +119,24 @@ stack_top:
 
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
+    serial::init();
+    serial::serial_println("CloudOS v0.0.2 booting...");
+
     vga::init();
     vga::show_splash();
 
     keyboard::init();
     interrupts::init();
 
-    input_loop();
+    shell::run();
 }
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     cpu_interrupts::disable();
     vga::write_string("\nPANIC");
+    serial::serial_println("PANIC");
     halt_loop();
-}
-
-fn input_loop() -> ! {
-    let mut input = [0u8; vga::input_capacity()];
-    let mut input_len = 0usize;
-
-    loop {
-        cpu_interrupts::disable();
-        interrupts::poll_keyboard();
-
-        if let Some(byte) = interrupts::pop_key() {
-            cpu_interrupts::enable();
-            match byte {
-                b'\n' => {
-                    input_len = 0;
-                }
-                8 => {
-                    input_len = input_len.saturating_sub(1);
-                }
-                b'\t' => {
-                    if input_len < vga::input_capacity() {
-                        input[input_len] = b' ';
-                        input_len += 1;
-                    }
-                }
-                0x20..=0x7e => {
-                    if input_len < vga::input_capacity() {
-                        input[input_len] = byte;
-                        input_len += 1;
-                    }
-                }
-                _ => {}
-            }
-
-            vga::render_input_line(&input[..input_len]);
-        } else {
-            cpu_interrupts::enable_and_hlt();
-        }
-    }
 }
 
 fn halt_loop() -> ! {

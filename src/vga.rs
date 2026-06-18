@@ -1,11 +1,12 @@
 use core::ptr::NonNull;
 use volatile::VolatilePtr;
+use x86_64::instructions::interrupts as cpu_interrupts;
 
 const WHITE_ON_BLUE: u8 = 0x1f;
+const CURSOR_ON_BLUE: u8 = 0x71;
 const VGA_WIDTH: usize = 80;
 const VGA_HEIGHT: usize = 25;
-const INPUT_ROW: usize = 18;
-const INPUT_COLUMN: usize = 4;
+const INPUT_COLUMNS_PER_ROW: usize = VGA_WIDTH - 2;
 const PROMPT: &[u8] = b"> ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,7 +19,10 @@ pub struct ScreenChar {
 struct Writer {
     row: usize,
     column: usize,
+    input_row: usize,
     color_code: u8,
+    cursor_visible: bool,
+    cursor_saved: ScreenChar,
     buffer: *mut ScreenChar,
 }
 
@@ -27,17 +31,104 @@ impl Writer {
         Self {
             row: 0,
             column: 0,
+            input_row: 0,
             color_code: WHITE_ON_BLUE,
+            cursor_visible: false,
+            cursor_saved: ScreenChar {
+                ascii_character: b' ',
+                color_code: WHITE_ON_BLUE,
+            },
             buffer: 0xb8000 as *mut ScreenChar,
         }
     }
 
     fn clear_screen(&mut self) {
+        self.hide_cursor();
+
         for offset in 0..(VGA_WIDTH * VGA_HEIGHT) {
             self.write_cell(offset, b' ', self.color_code);
         }
+
         self.row = 0;
         self.column = 0;
+        self.input_row = 0;
+    }
+
+    fn show_splash(&mut self) {
+        self.clear_screen();
+        self.write_centered(10, "CloudOS");
+        self.write_centered(12, "Kernel v0.0.2 - Booted");
+        self.write_string_at(16, 4, "Keyboard input ready:");
+        self.set_cursor(18, 0);
+    }
+
+    fn start_prompt(&mut self) {
+        self.hide_cursor();
+
+        if self.column != 0 {
+            self.new_line();
+        }
+
+        self.input_row = self.row;
+        self.render_input(&[]);
+    }
+
+    fn render_input(&mut self, input: &[u8]) {
+        self.hide_cursor();
+
+        let rows_needed = (input.len() / INPUT_COLUMNS_PER_ROW) + 1;
+        if self.input_row + rows_needed > VGA_HEIGHT {
+            let scroll_count = self.input_row + rows_needed - VGA_HEIGHT;
+            for _ in 0..scroll_count {
+                self.scroll_up();
+            }
+            self.input_row = self.input_row.saturating_sub(scroll_count);
+        }
+
+        for row in self.input_row..VGA_HEIGHT {
+            self.clear_row(row);
+        }
+
+        let mut remaining = input;
+        let mut row = self.input_row;
+
+        loop {
+            self.write_prompt_at(row);
+
+            let take = remaining.len().min(INPUT_COLUMNS_PER_ROW);
+            for (index, byte) in remaining.iter().copied().take(take).enumerate() {
+                self.write_cell(
+                    row * VGA_WIDTH + PROMPT.len() + index,
+                    vga_byte(byte),
+                    self.color_code,
+                );
+            }
+
+            remaining = &remaining[take..];
+
+            if remaining.is_empty() {
+                if take == INPUT_COLUMNS_PER_ROW {
+                    row += 1;
+                    if row >= VGA_HEIGHT {
+                        self.scroll_up();
+                        row = VGA_HEIGHT - 1;
+                        self.input_row = self.input_row.saturating_sub(1);
+                    }
+                    self.write_prompt_at(row);
+                    self.set_cursor(row, PROMPT.len());
+                } else {
+                    self.set_cursor(row, PROMPT.len() + take);
+                }
+                break;
+            }
+
+            row += 1;
+            if row >= VGA_HEIGHT {
+                self.scroll_up();
+                row = VGA_HEIGHT - 1;
+                self.input_row = self.input_row.saturating_sub(1);
+            }
+        }
     }
 
     fn write_centered(&mut self, row: usize, s: &str) {
@@ -60,15 +151,29 @@ impl Writer {
         }
     }
 
+    fn write_prompt_at(&mut self, row: usize) {
+        for (index, byte) in PROMPT.iter().copied().enumerate() {
+            self.write_cell(row * VGA_WIDTH + index, byte, self.color_code);
+        }
+    }
+
     fn set_cursor(&mut self, row: usize, column: usize) {
+        self.hide_cursor();
         self.row = row.min(VGA_HEIGHT - 1);
         self.column = column.min(VGA_WIDTH - 1);
     }
 
     fn write_string(&mut self, s: &str) {
+        self.hide_cursor();
+
         for byte in s.bytes() {
             self.write_byte(byte);
         }
+    }
+
+    fn write_line(&mut self, s: &str) {
+        self.write_string(s);
+        self.write_byte(b'\n');
     }
 
     fn write_byte(&mut self, byte: u8) {
@@ -83,6 +188,10 @@ impl Writer {
                 let offset = self.row * VGA_WIDTH + self.column;
                 self.write_cell(offset, vga_byte(byte), self.color_code);
                 self.column += 1;
+
+                if self.column >= VGA_WIDTH {
+                    self.new_line();
+                }
             }
         }
     }
@@ -111,6 +220,8 @@ impl Writer {
     }
 
     fn scroll_up(&mut self) {
+        self.hide_cursor();
+
         for row in 1..VGA_HEIGHT {
             for column in 0..VGA_WIDTH {
                 let from = row * VGA_WIDTH + column;
@@ -130,6 +241,39 @@ impl Writer {
         for column in 0..VGA_WIDTH {
             self.write_cell(start + column, b' ', self.color_code);
         }
+    }
+
+    fn toggle_cursor(&mut self) {
+        if self.cursor_visible {
+            self.hide_cursor();
+        } else {
+            self.show_cursor();
+        }
+    }
+
+    fn show_cursor(&mut self) {
+        if self.cursor_visible {
+            return;
+        }
+
+        let offset = self.row * VGA_WIDTH + self.column;
+        self.cursor_saved = self.read_cell(offset);
+        self.write_cell(offset, b'_', CURSOR_ON_BLUE);
+        self.cursor_visible = true;
+    }
+
+    fn hide_cursor(&mut self) {
+        if !self.cursor_visible {
+            return;
+        }
+
+        let offset = self.row * VGA_WIDTH + self.column;
+        self.write_cell(
+            offset,
+            self.cursor_saved.ascii_character,
+            self.cursor_saved.color_code,
+        );
+        self.cursor_visible = false;
     }
 
     fn read_cell(&self, offset: usize) -> ScreenChar {
@@ -154,47 +298,34 @@ pub fn init() {
 }
 
 pub fn show_splash() {
-    with_writer(|writer| {
-        writer.clear_screen();
-        writer.write_centered(10, "CloudOS");
-        writer.write_centered(12, "Kernel v0.0.1 - Booted");
-        writer.write_string_at(16, 4, "Keyboard input ready:");
-    });
-    render_input_line(&[]);
+    with_writer(|writer| writer.show_splash());
 }
 
-pub const fn input_capacity() -> usize {
-    VGA_WIDTH - INPUT_COLUMN - PROMPT.len()
+pub fn start_prompt() {
+    with_writer(|writer| writer.start_prompt());
 }
 
-pub fn render_input_line(input: &[u8]) {
-    with_writer(|writer| {
-        writer.clear_row(INPUT_ROW);
-
-        let mut column = INPUT_COLUMN;
-        for byte in PROMPT {
-            writer.write_cell(INPUT_ROW * VGA_WIDTH + column, *byte, writer.color_code);
-            column += 1;
-        }
-
-        let max_len = input_capacity();
-        for byte in input.iter().copied().take(max_len) {
-            writer.write_cell(
-                INPUT_ROW * VGA_WIDTH + column,
-                vga_byte(byte),
-                writer.color_code,
-            );
-            column += 1;
-        }
-    });
+pub fn render_input(input: &[u8]) {
+    with_writer(|writer| writer.render_input(input));
 }
 
-pub fn write_byte(byte: u8) {
-    with_writer(|writer| writer.write_byte(byte));
+pub fn toggle_cursor() {
+    with_writer(|writer| writer.toggle_cursor());
 }
 
 pub fn write_string(s: &str) {
     with_writer(|writer| writer.write_string(s));
+}
+
+pub fn write_line(s: &str) {
+    with_writer(|writer| writer.write_line(s));
+}
+
+pub fn write_byte(byte: u8) {
+    with_writer(|writer| {
+        writer.hide_cursor();
+        writer.write_byte(byte);
+    });
 }
 
 pub fn clear_screen() {
@@ -202,10 +333,10 @@ pub fn clear_screen() {
 }
 
 fn with_writer<R>(f: impl FnOnce(&mut Writer) -> R) -> R {
-    unsafe {
+    cpu_interrupts::without_interrupts(|| unsafe {
         let writer = core::ptr::addr_of_mut!(WRITER);
         f(&mut *writer)
-    }
+    })
 }
 
 fn vga_byte(byte: u8) -> u8 {

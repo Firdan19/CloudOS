@@ -18,8 +18,12 @@ jobs:
       - name: Install GRUB ISO tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y grub-pc-bin xorriso mtools
-      - run: RUSTFLAGS="-C link-arg=-Tlinker.ld" cargo build --release --target x86_64-unknown-none.json -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Zjson-target-spec
+          sudo apt-get install -y grub-pc-bin xorriso mtools nasm
+      - name: Assemble interrupt stubs
+        run: |
+          mkdir -p target
+          nasm -f elf64 src/interrupts.asm -o target/interrupts.o
+      - run: RUSTFLAGS="-C link-arg=-Tlinker.ld -C link-arg=$PWD/target/interrupts.o" cargo build --release --target x86_64-unknown-none.json -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Zjson-target-spec
       - name: Prepare ISO root
         run: |
           mkdir -p iso/boot/grub

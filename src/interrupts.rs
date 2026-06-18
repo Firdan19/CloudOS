@@ -1,5 +1,4 @@
-use crate::{keyboard, vga};
-use core::arch::global_asm;
+use crate::{keyboard, serial, vga};
 use core::mem::size_of;
 use x86_64::instructions::interrupts as cpu_interrupts;
 use x86_64::instructions::port::Port;
@@ -19,107 +18,18 @@ const PIC_EOI: u8 = 0x20;
 
 const PIC_1_OFFSET: u8 = 32;
 const PIC_2_OFFSET: u8 = 40;
+const TIMER_IRQ: u8 = 0;
 const KEYBOARD_IRQ: u8 = 1;
+const TIMER_VECTOR: usize = (PIC_1_OFFSET + TIMER_IRQ) as usize;
 const KEYBOARD_VECTOR: usize = (PIC_1_OFFSET + KEYBOARD_IRQ) as usize;
 
-global_asm!(
-    r#"
-    .att_syntax prefix
-    .section .text.interrupts, "ax"
-    .code64
-
-    .macro PUSH_REGS
-        pushq %rax
-        pushq %rbx
-        pushq %rcx
-        pushq %rdx
-        pushq %rsi
-        pushq %rdi
-        pushq %rbp
-        pushq %r8
-        pushq %r9
-        pushq %r10
-        pushq %r11
-        pushq %r12
-        pushq %r13
-        pushq %r14
-        pushq %r15
-    .endm
-
-    .macro POP_REGS
-        popq %r15
-        popq %r14
-        popq %r13
-        popq %r12
-        popq %r11
-        popq %r10
-        popq %r9
-        popq %r8
-        popq %rbp
-        popq %rdi
-        popq %rsi
-        popq %rdx
-        popq %rcx
-        popq %rbx
-        popq %rax
-    .endm
-
-    .global keyboard_interrupt_stub
-keyboard_interrupt_stub:
-    PUSH_REGS
-    movq %rsp, %rax
-    andq $-16, %rsp
-    subq $16, %rsp
-    movq %rax, (%rsp)
-    cld
-    call keyboard_interrupt_handler
-    movq (%rsp), %rsp
-    POP_REGS
-    iretq
-
-    .global default_irq_stub
-default_irq_stub:
-    PUSH_REGS
-    movq %rsp, %rax
-    andq $-16, %rsp
-    subq $16, %rsp
-    movq %rax, (%rsp)
-    cld
-    call default_irq_handler
-    movq (%rsp), %rsp
-    POP_REGS
-    iretq
-
-    .global default_interrupt_stub
-default_interrupt_stub:
-    PUSH_REGS
-    movq %rsp, %rax
-    andq $-16, %rsp
-    subq $16, %rsp
-    movq %rax, (%rsp)
-    cld
-    call exception_handler
-    movq (%rsp), %rsp
-    POP_REGS
-    iretq
-
-    .global default_exception_with_error_stub
-default_exception_with_error_stub:
-    addq $8, %rsp
-    PUSH_REGS
-    movq %rsp, %rax
-    andq $-16, %rsp
-    subq $16, %rsp
-    movq %rax, (%rsp)
-    cld
-    call exception_handler
-    movq (%rsp), %rsp
-    POP_REGS
-    iretq
-"#
-);
+const PIT_COMMAND_PORT: u16 = 0x43;
+const PIT_CHANNEL_0_PORT: u16 = 0x40;
+const PIT_MODE_3_BINARY: u8 = 0x36;
+const PIT_DIVISOR_18HZ: u16 = 65535;
 
 unsafe extern "C" {
+    fn timer_interrupt_stub();
     fn keyboard_interrupt_stub();
     fn default_irq_stub();
     fn default_interrupt_stub();
@@ -171,9 +81,11 @@ pub fn init() {
     unsafe {
         init_idt();
         remap_pic();
+        init_pit();
     }
 
     cpu_interrupts::enable();
+    serial::serial_println("interrupts: idt, pic, pit ready");
 }
 
 pub fn pop_key() -> Option<u8> {
@@ -206,6 +118,7 @@ unsafe fn init_idt() {
     }
 
     unsafe {
+        (*idt.add(TIMER_VECTOR)).set_handler(timer_interrupt_stub);
         (*idt.add(KEYBOARD_VECTOR)).set_handler(keyboard_interrupt_stub);
     }
 
@@ -246,8 +159,20 @@ unsafe fn remap_pic() {
         pic2_data.write(0x01);
         io_wait();
 
-        pic1_data.write(0b1111_1101);
+        pic1_data.write(0b1111_1100);
         pic2_data.write(0xff);
+    }
+}
+
+unsafe fn init_pit() {
+    let mut command = Port::<u8>::new(PIT_COMMAND_PORT);
+    let mut channel_0 = Port::<u8>::new(PIT_CHANNEL_0_PORT);
+    let divisor = PIT_DIVISOR_18HZ;
+
+    unsafe {
+        command.write(PIT_MODE_3_BINARY);
+        channel_0.write((divisor & 0x00ff) as u8);
+        channel_0.write((divisor >> 8) as u8);
     }
 }
 
@@ -273,6 +198,15 @@ unsafe fn send_eoi(irq: u8) {
 }
 
 #[no_mangle]
+pub extern "C" fn timer_interrupt_handler() {
+    vga::toggle_cursor();
+
+    unsafe {
+        send_eoi(TIMER_IRQ);
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn keyboard_interrupt_handler() {
     keyboard::handle_interrupt();
 
@@ -284,13 +218,14 @@ pub extern "C" fn keyboard_interrupt_handler() {
 #[no_mangle]
 pub extern "C" fn default_irq_handler() {
     unsafe {
-        send_eoi(0);
+        send_eoi(TIMER_IRQ);
     }
 }
 
 #[no_mangle]
 pub extern "C" fn exception_handler() {
     cpu_interrupts::disable();
+    serial::serial_println("exception: CPU fault captured");
     vga::write_string("\nCPU fault captured. System halted.");
     loop {
         x86_64::instructions::hlt();
