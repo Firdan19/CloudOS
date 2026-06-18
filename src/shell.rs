@@ -3,12 +3,107 @@ use crate::{interrupts, serial, vga};
 use x86_64::instructions::interrupts as cpu_interrupts;
 
 const INPUT_BUFFER_SIZE: usize = 512;
+const HISTORY_SIZE: usize = 16;
 const PIT_HZ: u64 = 18;
+
+struct CommandHistory {
+    entries: [[u8; INPUT_BUFFER_SIZE]; HISTORY_SIZE],
+    lengths: [usize; HISTORY_SIZE],
+    len: usize,
+}
+
+impl CommandHistory {
+    const fn new() -> Self {
+        Self {
+            entries: [[0; INPUT_BUFFER_SIZE]; HISTORY_SIZE],
+            lengths: [0; HISTORY_SIZE],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, input: &[u8]) {
+        let input = trim_ascii(input);
+
+        if input.is_empty() {
+            return;
+        }
+
+        if self.is_same_as_latest(input) {
+            return;
+        }
+
+        if self.len == HISTORY_SIZE {
+            for index in 1..HISTORY_SIZE {
+                self.entries[index - 1] = self.entries[index];
+                self.lengths[index - 1] = self.lengths[index];
+            }
+            self.len -= 1;
+        }
+
+        let index = self.len;
+        self.entries[index][..input.len()].copy_from_slice(input);
+        self.lengths[index] = input.len();
+        self.len += 1;
+    }
+
+    fn latest_index(&self) -> Option<usize> {
+        if self.len == 0 {
+            None
+        } else {
+            Some(self.len - 1)
+        }
+    }
+
+    fn previous_index(&self, selected: Option<usize>) -> Option<usize> {
+        match selected {
+            Some(index) if index > 0 => Some(index - 1),
+            Some(index) => Some(index),
+            None => self.latest_index(),
+        }
+    }
+
+    fn next_index(&self, selected: Option<usize>) -> Option<usize> {
+        match selected {
+            Some(index) if index + 1 < self.len => Some(index + 1),
+            Some(_) | None => None,
+        }
+    }
+
+    fn load(
+        &self,
+        index: usize,
+        input: &mut [u8; INPUT_BUFFER_SIZE],
+        input_len: &mut usize,
+        cursor: &mut usize,
+    ) -> bool {
+        if index >= self.len {
+            return false;
+        }
+
+        let len = self.lengths[index];
+        input[..len].copy_from_slice(&self.entries[index][..len]);
+        *input_len = len;
+        *cursor = len;
+
+        true
+    }
+
+    fn is_same_as_latest(&self, input: &[u8]) -> bool {
+        if self.len == 0 {
+            return false;
+        }
+
+        let index = self.len - 1;
+        self.lengths[index] == input.len() && &self.entries[index][..input.len()] == input
+    }
+}
 
 pub fn run() -> ! {
     let mut input = [0u8; INPUT_BUFFER_SIZE];
     let mut input_len = 0usize;
     let mut cursor = 0usize;
+    let mut history = CommandHistory::new();
+    let mut history_selected = None;
 
     prompt();
 
@@ -23,29 +118,35 @@ pub fn run() -> ! {
                 KeyEvent::Enter => {
                     serial::serial_println("");
                     vga::write_byte(b'\n');
+                    history.push(&input[..input_len]);
                     execute(&input[..input_len]);
                     input_len = 0;
                     cursor = 0;
+                    history_selected = None;
                     prompt();
                 }
                 KeyEvent::Backspace => {
                     if delete_previous_input_byte(&mut input, &mut input_len, &mut cursor) {
+                        history_selected = None;
                         vga::render_input_with_cursor(&input[..input_len], cursor);
                     }
                 }
                 KeyEvent::Escape => {
                     input_len = 0;
                     cursor = 0;
+                    history_selected = None;
                     serial::serial_println("^esc");
                     vga::render_input_with_cursor(&input[..input_len], cursor);
                 }
                 KeyEvent::Tab => {
                     if insert_input_byte(&mut input, &mut input_len, &mut cursor, b' ') {
+                        history_selected = None;
                         vga::render_input_with_cursor(&input[..input_len], cursor);
                     }
                 }
                 KeyEvent::Char(byte) if (0x20..=0x7e).contains(&byte) => {
                     if insert_input_byte(&mut input, &mut input_len, &mut cursor, byte) {
+                        history_selected = None;
                         vga::render_input_with_cursor(&input[..input_len], cursor);
                     }
                 }
@@ -61,10 +162,28 @@ pub fn run() -> ! {
                         vga::render_input_with_cursor(&input[..input_len], cursor);
                     }
                 }
-                KeyEvent::ArrowUp
-                | KeyEvent::ArrowDown
-                | KeyEvent::ShiftPressed
-                | KeyEvent::ShiftReleased => {}
+                KeyEvent::ArrowUp => {
+                    if let Some(index) = history.previous_index(history_selected) {
+                        history_selected = Some(index);
+                        if history.load(index, &mut input, &mut input_len, &mut cursor) {
+                            vga::render_input_with_cursor(&input[..input_len], cursor);
+                        }
+                    }
+                }
+                KeyEvent::ArrowDown => {
+                    if let Some(index) = history.next_index(history_selected) {
+                        history_selected = Some(index);
+                        if history.load(index, &mut input, &mut input_len, &mut cursor) {
+                            vga::render_input_with_cursor(&input[..input_len], cursor);
+                        }
+                    } else if history_selected.is_some() {
+                        history_selected = None;
+                        input_len = 0;
+                        cursor = 0;
+                        vga::render_input_with_cursor(&input[..input_len], cursor);
+                    }
+                }
+                KeyEvent::ShiftPressed | KeyEvent::ShiftReleased => {}
                 KeyEvent::CapsLockToggled(enabled) => {
                     if enabled {
                         serial::serial_println("[keyboard] caps lock on");

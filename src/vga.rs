@@ -71,7 +71,7 @@ impl Writer {
         self.write_centered_color(3, "Kernel v0.0.5 - Shell Line Editor", TEXT_ON_LIGHT);
         self.write_centered_color(
             5,
-            "help clear version about echo uptime  |  Esc clears input",
+            "help clear version about echo uptime  |  Up/Down history  |  Esc clears input",
             MUTED_ON_LIGHT,
         );
         self.draw_panel();
