@@ -1,3 +1,4 @@
+use crate::keyboard::KeyEvent;
 use crate::{keyboard, serial, vga};
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -87,11 +88,11 @@ pub fn init() {
     }
 
     cpu_interrupts::enable();
-    serial::serial_println("interrupts: idt, pic, pit ready");
+    serial::serial_println("[irq] idt, pic, pit ready");
 }
 
-pub fn pop_key() -> Option<u8> {
-    keyboard::pop_key()
+pub fn pop_key_event() -> Option<KeyEvent> {
+    keyboard::pop_event()
 }
 
 pub fn poll_keyboard() {
@@ -232,7 +233,7 @@ pub extern "C" fn default_irq_handler() {
 #[no_mangle]
 pub extern "C" fn exception_handler() {
     cpu_interrupts::disable();
-    serial::serial_println("exception: CPU fault captured");
+    serial::serial_println("[panic] CPU fault captured");
     vga::write_string("\nCPU fault captured. System halted.");
     loop {
         x86_64::instructions::hlt();

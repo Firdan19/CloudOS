@@ -27,6 +27,12 @@ pub fn serial_print(s: &str) {
     }
 }
 
+pub fn serial_print_bytes(bytes: &[u8]) {
+    for byte in bytes.iter().copied() {
+        write_byte(byte);
+    }
+}
+
 pub fn serial_println(s: &str) {
     serial_print(s);
     serial_print("\n");

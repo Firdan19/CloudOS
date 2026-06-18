@@ -1,3 +1,4 @@
+use crate::keyboard::KeyEvent;
 use crate::{interrupts, serial, vga};
 use x86_64::instructions::interrupts as cpu_interrupts;
 
@@ -14,36 +15,49 @@ pub fn run() -> ! {
         cpu_interrupts::disable();
         interrupts::poll_keyboard();
 
-        if let Some(byte) = interrupts::pop_key() {
+        if let Some(event) = interrupts::pop_key_event() {
             cpu_interrupts::enable();
 
-            match byte {
-                b'\n' => {
+            match event {
+                KeyEvent::Enter => {
                     serial::serial_println("");
                     vga::write_byte(b'\n');
                     execute(&input[..input_len]);
                     input_len = 0;
                     prompt();
                 }
-                8 => {
+                KeyEvent::Backspace => {
                     if input_len > 0 {
                         input_len -= 1;
                         serial::serial_print("\x08 \x08");
                         vga::render_input(&input[..input_len]);
                     }
                 }
-                27 => {
+                KeyEvent::Escape => {
                     input_len = 0;
                     serial::serial_println("^esc");
                     vga::render_input(&input[..input_len]);
                 }
-                b'\t' => {
+                KeyEvent::Tab => {
                     push_input_byte(&mut input, &mut input_len, b' ');
                 }
-                0x20..=0x7e => {
+                KeyEvent::Char(byte) if (0x20..=0x7e).contains(&byte) => {
                     push_input_byte(&mut input, &mut input_len, byte);
                 }
-                _ => {}
+                KeyEvent::ArrowUp
+                | KeyEvent::ArrowDown
+                | KeyEvent::ArrowLeft
+                | KeyEvent::ArrowRight
+                | KeyEvent::ShiftPressed
+                | KeyEvent::ShiftReleased => {}
+                KeyEvent::CapsLockToggled(enabled) => {
+                    if enabled {
+                        serial::serial_println("[keyboard] caps lock on");
+                    } else {
+                        serial::serial_println("[keyboard] caps lock off");
+                    }
+                }
+                KeyEvent::Char(_) => {}
             }
         } else {
             cpu_interrupts::enable_and_hlt();
@@ -75,6 +89,9 @@ fn execute(input: &[u8]) {
     }
 
     let (command, arguments) = split_command(command_line);
+    serial::serial_print("[shell] command: ");
+    serial::serial_print_bytes(command);
+    serial::serial_println("");
 
     if eq_ignore_ascii_case(command, b"help") {
         println("help clear version about echo uptime");
@@ -82,7 +99,7 @@ fn execute(input: &[u8]) {
         serial::serial_println("clear");
         vga::show_splash();
     } else if eq_ignore_ascii_case(command, b"version") {
-        println("CloudOS v0.0.4");
+        println("CloudOS v0.0.5");
     } else if eq_ignore_ascii_case(command, b"about") {
         println("CloudOS: Sistem operasi untuk semua, tanpa perlu perangkat mahal.");
     } else if eq_ignore_ascii_case(command, b"echo") {

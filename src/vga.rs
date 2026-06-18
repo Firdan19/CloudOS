@@ -68,7 +68,7 @@ impl Writer {
         self.clear_screen();
         self.draw_status_bar();
         self.write_centered_color(2, "CloudOS", ACCENT_ON_LIGHT);
-        self.write_centered_color(3, "Kernel v0.0.4 - Console Polish", TEXT_ON_LIGHT);
+        self.write_centered_color(3, "Kernel v0.0.5 - Keyboard Events", TEXT_ON_LIGHT);
         self.write_centered_color(
             5,
             "help clear version about echo uptime  |  Esc clears input",
@@ -181,7 +181,7 @@ impl Writer {
         self.clear_row_with_color(0, BAR_COLOR);
         self.write_string_at_color(0, 2, "CloudOS Terminal", BAR_COLOR);
         self.write_centered_color(0, "Phase 1 Console", BAR_COLOR);
-        self.write_string_at_color(0, 68, "v0.0.4", BAR_COLOR);
+        self.write_string_at_color(0, 68, "v0.0.5", BAR_COLOR);
     }
 
     fn draw_panel(&mut self) {
