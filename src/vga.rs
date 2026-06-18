@@ -68,7 +68,7 @@ impl Writer {
         self.clear_screen();
         self.draw_status_bar();
         self.write_centered_color(2, "CloudOS", ACCENT_ON_LIGHT);
-        self.write_centered_color(3, "Kernel v0.0.5 - Keyboard Events", TEXT_ON_LIGHT);
+        self.write_centered_color(3, "Kernel v0.0.5 - Shell Line Editor", TEXT_ON_LIGHT);
         self.write_centered_color(
             5,
             "help clear version about echo uptime  |  Esc clears input",
@@ -90,6 +90,10 @@ impl Writer {
     }
 
     fn render_input(&mut self, input: &[u8]) {
+        self.render_input_with_cursor(input, input.len());
+    }
+
+    fn render_input_with_cursor(&mut self, input: &[u8], cursor_index: usize) {
         self.hide_cursor();
 
         let rows_needed = (input.len() / INPUT_COLUMNS_PER_ROW) + 1;
@@ -105,46 +109,29 @@ impl Writer {
             self.clear_console_row(row);
         }
 
-        let mut remaining = input;
-        let mut row = self.input_row;
+        for visual_row in 0..rows_needed {
+            let row = self.input_row + visual_row;
+            let start = visual_row * INPUT_COLUMNS_PER_ROW;
+            let end = start.saturating_add(INPUT_COLUMNS_PER_ROW).min(input.len());
 
-        loop {
             self.write_prompt_at(row);
 
-            let take = remaining.len().min(INPUT_COLUMNS_PER_ROW);
-            for (index, byte) in remaining.iter().copied().take(take).enumerate() {
-                self.write_cell(
-                    row * VGA_WIDTH + CONSOLE_LEFT + PROMPT.len() + index,
-                    vga_byte(byte),
-                    self.color_code,
-                );
-            }
-
-            remaining = &remaining[take..];
-
-            if remaining.is_empty() {
-                if take == INPUT_COLUMNS_PER_ROW {
-                    row += 1;
-                    if row > CONSOLE_BOTTOM {
-                        self.scroll_console_up();
-                        row = CONSOLE_BOTTOM;
-                        self.input_row = self.input_row.saturating_sub(1).max(CONSOLE_TOP);
-                    }
-                    self.write_prompt_at(row);
-                    self.set_cursor(row, CONSOLE_LEFT + PROMPT.len());
-                } else {
-                    self.set_cursor(row, CONSOLE_LEFT + PROMPT.len() + take);
+            if start < input.len() {
+                for (index, byte) in input[start..end].iter().copied().enumerate() {
+                    self.write_cell(
+                        row * VGA_WIDTH + CONSOLE_LEFT + PROMPT.len() + index,
+                        vga_byte(byte),
+                        self.color_code,
+                    );
                 }
-                break;
-            }
-
-            row += 1;
-            if row > CONSOLE_BOTTOM {
-                self.scroll_console_up();
-                row = CONSOLE_BOTTOM;
-                self.input_row = self.input_row.saturating_sub(1).max(CONSOLE_TOP);
             }
         }
+
+        let cursor_index = cursor_index.min(input.len());
+        let cursor_row = self.input_row + (cursor_index / INPUT_COLUMNS_PER_ROW);
+        let cursor_column = CONSOLE_LEFT + PROMPT.len() + (cursor_index % INPUT_COLUMNS_PER_ROW);
+
+        self.set_cursor(cursor_row, cursor_column);
     }
 
     fn write_centered_color(&mut self, row: usize, s: &str, color_code: u8) {
@@ -370,6 +357,10 @@ pub fn start_prompt() {
 
 pub fn render_input(input: &[u8]) {
     with_writer(|writer| writer.render_input(input));
+}
+
+pub fn render_input_with_cursor(input: &[u8], cursor_index: usize) {
+    with_writer(|writer| writer.render_input_with_cursor(input, cursor_index));
 }
 
 pub fn toggle_cursor() {

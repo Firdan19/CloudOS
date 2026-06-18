@@ -8,6 +8,7 @@ const PIT_HZ: u64 = 18;
 pub fn run() -> ! {
     let mut input = [0u8; INPUT_BUFFER_SIZE];
     let mut input_len = 0usize;
+    let mut cursor = 0usize;
 
     prompt();
 
@@ -24,30 +25,44 @@ pub fn run() -> ! {
                     vga::write_byte(b'\n');
                     execute(&input[..input_len]);
                     input_len = 0;
+                    cursor = 0;
                     prompt();
                 }
                 KeyEvent::Backspace => {
-                    if input_len > 0 {
-                        input_len -= 1;
-                        serial::serial_print("\x08 \x08");
-                        vga::render_input(&input[..input_len]);
+                    if delete_previous_input_byte(&mut input, &mut input_len, &mut cursor) {
+                        vga::render_input_with_cursor(&input[..input_len], cursor);
                     }
                 }
                 KeyEvent::Escape => {
                     input_len = 0;
+                    cursor = 0;
                     serial::serial_println("^esc");
-                    vga::render_input(&input[..input_len]);
+                    vga::render_input_with_cursor(&input[..input_len], cursor);
                 }
                 KeyEvent::Tab => {
-                    push_input_byte(&mut input, &mut input_len, b' ');
+                    if insert_input_byte(&mut input, &mut input_len, &mut cursor, b' ') {
+                        vga::render_input_with_cursor(&input[..input_len], cursor);
+                    }
                 }
                 KeyEvent::Char(byte) if (0x20..=0x7e).contains(&byte) => {
-                    push_input_byte(&mut input, &mut input_len, byte);
+                    if insert_input_byte(&mut input, &mut input_len, &mut cursor, byte) {
+                        vga::render_input_with_cursor(&input[..input_len], cursor);
+                    }
+                }
+                KeyEvent::ArrowLeft => {
+                    if cursor > 0 {
+                        cursor -= 1;
+                        vga::render_input_with_cursor(&input[..input_len], cursor);
+                    }
+                }
+                KeyEvent::ArrowRight => {
+                    if cursor < input_len {
+                        cursor += 1;
+                        vga::render_input_with_cursor(&input[..input_len], cursor);
+                    }
                 }
                 KeyEvent::ArrowUp
                 | KeyEvent::ArrowDown
-                | KeyEvent::ArrowLeft
-                | KeyEvent::ArrowRight
                 | KeyEvent::ShiftPressed
                 | KeyEvent::ShiftReleased => {}
                 KeyEvent::CapsLockToggled(enabled) => {
@@ -65,15 +80,56 @@ pub fn run() -> ! {
     }
 }
 
-fn push_input_byte(input: &mut [u8; INPUT_BUFFER_SIZE], input_len: &mut usize, byte: u8) {
+fn insert_input_byte(
+    input: &mut [u8; INPUT_BUFFER_SIZE],
+    input_len: &mut usize,
+    cursor: &mut usize,
+    byte: u8,
+) -> bool {
     if *input_len >= INPUT_BUFFER_SIZE {
-        return;
+        return false;
     }
 
-    input[*input_len] = byte;
+    if *cursor > *input_len {
+        *cursor = *input_len;
+    }
+
+    let mut index = *input_len;
+    while index > *cursor {
+        input[index] = input[index - 1];
+        index -= 1;
+    }
+
+    input[*cursor] = byte;
     *input_len += 1;
-    serial::write_byte(byte);
-    vga::render_input(&input[..*input_len]);
+    *cursor += 1;
+
+    true
+}
+
+fn delete_previous_input_byte(
+    input: &mut [u8; INPUT_BUFFER_SIZE],
+    input_len: &mut usize,
+    cursor: &mut usize,
+) -> bool {
+    if *cursor == 0 || *input_len == 0 {
+        return false;
+    }
+
+    if *cursor > *input_len {
+        *cursor = *input_len;
+    }
+
+    let mut index = *cursor;
+    while index < *input_len {
+        input[index - 1] = input[index];
+        index += 1;
+    }
+
+    *cursor -= 1;
+    *input_len -= 1;
+
+    true
 }
 
 fn prompt() {
