@@ -110,7 +110,9 @@ pub extern "C" fn kernel_main() -> ! {
     let vga_ptr = unsafe { NonNull::new_unchecked(0xb8000 as *mut memory::ScreenChar) };
     let vga = unsafe { VolatilePtr::new(vga_ptr) };
 
-    memory::write_string(vga, "CloudOS Kernel v0.0.1 — Booted");
+    memory::clear_screen(vga);
+    memory::write_centered(vga, 11, "CloudOS");
+    memory::write_centered(vga, 13, "Kernel v0.0.1 - Booted");
 
     halt_loop();
 }
