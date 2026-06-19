@@ -14,7 +14,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 22] = [
+const COMMANDS: [Command; 23] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -119,6 +119,11 @@ const COMMANDS: [Command; 22] = [
         name: "dmesg",
         description: "alias untuk kernel ring log",
         handler: command_log,
+    },
+    Command {
+        name: "selftest",
+        description: "uji mandiri subsistem Phase 1",
+        handler: command_selftest,
     },
     Command {
         name: "bench",
@@ -454,6 +459,7 @@ fn command_sysinfo(_arguments: &[u8]) {
     println("  exceptions: vector-specific panic diagnostics");
     println("  shell     : line editor, history, command table");
     println("  klog      : in-memory kernel ring buffer");
+    println("  selftest  : non-destructive kernel diagnostics");
     println("  metrics   : perf, irq, boot, bench");
 }
 
@@ -875,6 +881,145 @@ fn command_log(arguments: &[u8]) {
     }
 }
 
+fn command_selftest(_arguments: &[u8]) {
+    let boot_info = multiboot::summary();
+    let memory = boot_info.memory;
+    let frames = physmem::snapshot();
+    let paging_state = paging::snapshot();
+    let vga_translation = paging::translate(VGA_BUFFER_ADDRESS);
+    let high_translation = paging::translate(0xffff_8000_0000_0000);
+    let gdt = gdt::snapshot();
+    let log = klog::snapshot();
+    let counters = stats::snapshot();
+    let ticks = interrupts::ticks();
+
+    let mut passed = 0u64;
+    let mut failed = 0u64;
+
+    serial::log("selftest", "started");
+    println("Tobacco selftest:");
+
+    selftest_check(
+        "multiboot magic",
+        boot_info.valid_magic,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "multiboot parsed",
+        boot_info.parsed && boot_info.tag_count > 0,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "memory map usable",
+        memory.has_memory_map && multiboot::stored_region_count() > 0 && memory.usable_bytes > 0,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "frame allocator ready",
+        frames.initialized && frames.allocatable_frames > 0 && frames.free_frames > 0,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "kernel memory protected",
+        frames.kernel_end > frames.kernel_start && frames.protected_until >= frames.kernel_end,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "paging initialized",
+        paging_state.initialized && paging_state.cr3 != 0,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "boot identity map",
+        paging_state.p4_present_entries == 1
+            && paging_state.p3_present_entries == 1
+            && paging_state.p2_present_entries == 512
+            && paging_state.huge_pages == 512
+            && paging_state.identity_mapped_bytes >= paging::BOOT_IDENTITY_MAP_BYTES,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "vga address translation",
+        vga_translation.mapped
+            && vga_translation.phys == VGA_BUFFER_ADDRESS
+            && vga_translation.huge_page,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "high address unmapped",
+        !high_translation.mapped,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "gdt tss ist ready",
+        gdt.loaded
+            && gdt.code_selector != 0
+            && gdt.data_selector != 0
+            && gdt.tss_selector != 0
+            && gdt.double_fault_stack_bytes >= STACK_BYTES,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "kernel log ring ready",
+        log.initialized && log.capacity == klog::ENTRY_COUNT as u64 && log.count > 0,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "serial output active",
+        counters.serial_bytes > 0,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "vga output active",
+        counters.vga_clears > 0 && counters.vga_cell_writes > 0,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "interrupt counters sane",
+        ticks >= counters.shell_ready_tick,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "keyboard queue sane",
+        keyboard::pending_events() < 256,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "command table sane",
+        COMMANDS.len() >= 20,
+        &mut passed,
+        &mut failed,
+    );
+
+    println("Selftest summary:");
+    print_counter("passed", passed);
+    print_counter("failed", failed);
+
+    if failed == 0 {
+        serial::log("selftest", "passed");
+        println("status: PASS");
+    } else {
+        serial::log("selftest", "failed");
+        stats::inc_shell_error();
+        println("status: FAIL");
+    }
+}
+
 fn command_bench(_arguments: &[u8]) {
     stats::inc_bench_run();
 
@@ -937,6 +1082,18 @@ fn print_counter(label: &str, value: u64) {
     print(": ");
     print_u64(value);
     newline();
+}
+
+fn selftest_check(label: &str, ok: bool, passed: &mut u64, failed: &mut u64) {
+    print("  ");
+    if ok {
+        print("[PASS] ");
+        *passed = (*passed).saturating_add(1);
+    } else {
+        print("[FAIL] ");
+        *failed = (*failed).saturating_add(1);
+    }
+    println(label);
 }
 
 fn print_bytes(bytes: u64) {
