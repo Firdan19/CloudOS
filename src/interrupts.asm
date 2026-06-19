@@ -30,6 +30,7 @@ global exception_21_control_protection_stub
 global exception_28_hypervisor_injection_stub
 global exception_29_vmm_communication_stub
 global exception_30_security_stub
+global ci_trigger_double_fault_stub
 
 extern timer_interrupt_handler
 extern keyboard_interrupt_handler
@@ -153,3 +154,11 @@ exception_common_stub:
     pop_regs
     add rsp, 16
     iretq
+
+ci_trigger_double_fault_stub:
+    cli
+    xor rsp, rsp
+    int3
+.halt:
+    hlt
+    jmp .halt

@@ -1,13 +1,28 @@
 use crate::{
     gdt, heap, interrupts, keyboard, klog, multiboot, paging, physmem, serial, shell, stats, vga,
 };
+use x86_64::instructions::hlt;
 
 const CI_BOOT_FLAG: &[u8] = b"tobacco.ci=smoke";
+const CI_PAGE_FAULT_FLAG: &[u8] = b"tobacco.ci=pagefault";
+const CI_DOUBLE_FAULT_FLAG: &[u8] = b"tobacco.ci=doublefault";
 const VGA_BUFFER_ADDRESS: u64 = 0x000b_8000;
+
+unsafe extern "C" {
+    fn ci_trigger_double_fault_stub() -> !;
+}
 
 pub fn run_if_requested() {
     let boot_info = multiboot::summary();
     let command_line = boot_info.command_line.as_str().as_bytes();
+
+    if contains_bytes(command_line, CI_PAGE_FAULT_FLAG) {
+        trigger_page_fault_for_ci();
+    }
+
+    if contains_bytes(command_line, CI_DOUBLE_FAULT_FLAG) {
+        trigger_double_fault_for_ci();
+    }
 
     if !contains_bytes(command_line, CI_BOOT_FLAG) {
         return;
@@ -35,6 +50,34 @@ pub fn run_if_requested() {
     }
 
     serial::log("ci", "command smoke complete");
+}
+
+fn trigger_page_fault_for_ci() -> ! {
+    let target = paging::KERNEL_HEAP_GUARD_LOW;
+    serial::log("ci-fault", "page fault trigger requested");
+    serial::log_hex_u64("ci-fault", "target address", target);
+
+    unsafe {
+        let _ = core::ptr::read_volatile(target as *const u8);
+    }
+
+    serial::log("ci-fault", "page fault trigger unexpectedly returned");
+    halt_forever()
+}
+
+fn trigger_double_fault_for_ci() -> ! {
+    serial::log("ci-fault", "double fault trigger requested");
+    serial::log("ci-fault", "forcing interrupt delivery on invalid stack");
+
+    unsafe {
+        ci_trigger_double_fault_stub();
+    }
+}
+
+fn halt_forever() -> ! {
+    loop {
+        hlt();
+    }
 }
 
 fn run_command_table_checks() {

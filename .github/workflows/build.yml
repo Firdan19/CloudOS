@@ -40,12 +40,33 @@ jobs:
         run: grub-mkrescue -o tobacco-ci.iso iso-ci
       - name: Smoke test ISO boot and commands
         run: sh scripts/ci-smoke-test.sh tobacco-ci.iso serial.log 12
+      - name: Prepare CI Page Fault ISO root
+        run: |
+          mkdir -p iso-ci-pagefault/boot/grub
+          cp target/x86_64-unknown-none/release/tobacco-kernel iso-ci-pagefault/boot/tobacco-kernel
+          cp scripts/grub-ci-pagefault.cfg iso-ci-pagefault/boot/grub/grub.cfg
+      - name: Create GRUB Multiboot2 CI Page Fault ISO
+        run: grub-mkrescue -o tobacco-ci-pagefault.iso iso-ci-pagefault
+      - name: Fault test page fault handler
+        run: sh scripts/ci-fault-test.sh tobacco-ci-pagefault.iso serial-pagefault.log pagefault 8
+      - name: Prepare CI Double Fault ISO root
+        run: |
+          mkdir -p iso-ci-doublefault/boot/grub
+          cp target/x86_64-unknown-none/release/tobacco-kernel iso-ci-doublefault/boot/tobacco-kernel
+          cp scripts/grub-ci-doublefault.cfg iso-ci-doublefault/boot/grub/grub.cfg
+      - name: Create GRUB Multiboot2 CI Double Fault ISO
+        run: grub-mkrescue -o tobacco-ci-doublefault.iso iso-ci-doublefault
+      - name: Fault test double fault handler
+        run: sh scripts/ci-fault-test.sh tobacco-ci-doublefault.iso serial-doublefault.log doublefault 8
       - name: Upload serial smoke log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: tobacco-serial-log
-          path: serial.log
+          path: |
+            serial.log
+            serial-pagefault.log
+            serial-doublefault.log
           if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         with:

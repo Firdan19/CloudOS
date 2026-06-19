@@ -323,6 +323,7 @@ pub extern "C" fn exception_dispatch_handler(context: *const ExceptionContext) -
         fault_address,
         context.cpu_flags,
     );
+    serial::log("panic", "exception screen rendered");
 
     loop {
         x86_64::instructions::hlt();
