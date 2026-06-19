@@ -1,5 +1,5 @@
 use crate::keyboard::KeyEvent;
-use crate::{keyboard, serial, stats, vga};
+use crate::{gdt, keyboard, serial, stats, vga};
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::instructions::interrupts as cpu_interrupts;
@@ -9,7 +9,6 @@ use x86_64::structures::DescriptorTablePointer;
 use x86_64::VirtAddr;
 
 const IDT_ENTRIES: usize = 256;
-const CODE_SELECTOR: u16 = 0x08;
 const INTERRUPT_GATE: u16 = 0x8e00;
 
 const PIC_1_COMMAND: u16 = 0x20;
@@ -96,11 +95,15 @@ impl IdtEntry {
     }
 
     fn set_handler(&mut self, handler: unsafe extern "C" fn()) {
+        self.set_handler_with_ist(handler, 0);
+    }
+
+    fn set_handler_with_ist(&mut self, handler: unsafe extern "C" fn(), ist_index: u16) {
         let address = handler as usize as u64;
 
         self.offset_low = address as u16;
-        self.selector = CODE_SELECTOR;
-        self.options = INTERRUPT_GATE;
+        self.selector = gdt::KERNEL_CODE_SELECTOR;
+        self.options = INTERRUPT_GATE | (ist_index & 0x0007);
         self.offset_mid = (address >> 16) as u16;
         self.offset_high = (address >> 32) as u32;
         self.reserved = 0;
@@ -153,7 +156,8 @@ unsafe fn init_idt() {
         (*idt.add(5)).set_handler(exception_05_bound_range_stub);
         (*idt.add(6)).set_handler(exception_06_invalid_opcode_stub);
         (*idt.add(7)).set_handler(exception_07_device_not_available_stub);
-        (*idt.add(8)).set_handler(exception_08_double_fault_stub);
+        (*idt.add(8))
+            .set_handler_with_ist(exception_08_double_fault_stub, gdt::DOUBLE_FAULT_IST_INDEX);
         (*idt.add(10)).set_handler(exception_10_invalid_tss_stub);
         (*idt.add(11)).set_handler(exception_11_segment_not_present_stub);
         (*idt.add(12)).set_handler(exception_12_stack_segment_fault_stub);

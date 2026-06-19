@@ -5,6 +5,7 @@ use core::panic::PanicInfo;
 use x86_64::instructions::hlt;
 use x86_64::instructions::interrupts as cpu_interrupts;
 
+mod gdt;
 mod interrupts;
 mod keyboard;
 mod multiboot;
@@ -133,6 +134,16 @@ stack_top:
 pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info_addr: u32) -> ! {
     serial::init();
     serial::log("boot", "Tobacco v0.0.5 booting...");
+    let gdt_state = gdt::init();
+    serial::log("gdt", "gdt, tss, ist ready");
+    serial::log_hex_u64("gdt", "gdt base", gdt_state.gdt_base);
+    serial::log_hex_u64("gdt", "tss base", gdt_state.tss_base);
+    serial::log_hex_u64(
+        "gdt",
+        "double fault ist top",
+        gdt_state.double_fault_stack_top,
+    );
+
     let boot_info = multiboot::init(multiboot_magic, multiboot_info_addr as u64);
     serial::log_bool("boot", "multiboot magic", boot_info.valid_magic);
     serial::log_u64("boot", "multiboot info addr", boot_info.address);

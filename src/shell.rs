@@ -1,5 +1,5 @@
 use crate::keyboard::{self, KeyEvent};
-use crate::{interrupts, multiboot, physmem, serial, stats, vga};
+use crate::{gdt, interrupts, multiboot, physmem, serial, stats, vga};
 use x86_64::instructions::interrupts as cpu_interrupts;
 
 const INPUT_BUFFER_SIZE: usize = 512;
@@ -16,7 +16,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 17] = [
+const COMMANDS: [Command; 18] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -96,6 +96,11 @@ const COMMANDS: [Command; 17] = [
         name: "boot",
         description: "tampilkan status boot Phase 1",
         handler: command_boot,
+    },
+    Command {
+        name: "gdt",
+        description: "status GDT, TSS, dan IST",
+        handler: command_gdt,
     },
     Command {
         name: "bench",
@@ -426,6 +431,7 @@ fn command_sysinfo(_arguments: &[u8]) {
     println("  keyboard  : PS/2 IRQ1 event layer");
     println("  boot info : Multiboot2 parser + memory map");
     println("  memory    : physical frame allocator");
+    println("  gdt/tss   : double fault IST stack");
     println("  exceptions: vector-specific panic diagnostics");
     println("  shell     : line editor, history, command table");
     println("  metrics   : perf, irq, boot, bench");
@@ -664,6 +670,7 @@ fn command_boot(_arguments: &[u8]) {
     let snapshot = stats::snapshot();
     let boot_info = multiboot::summary();
     let frames = physmem::snapshot();
+    let gdt = gdt::snapshot();
 
     println("Boot status:");
     println("  name          : Tobacco");
@@ -695,9 +702,45 @@ fn command_boot(_arguments: &[u8]) {
     print("  frame alloc   : ");
     print_on_off(frames.initialized);
     newline();
+    print("  gdt/tss       : ");
+    print_on_off(gdt.loaded);
+    newline();
     print_counter("free frames", frames.free_frames);
     print_counter("shell ready tick", snapshot.shell_ready_tick);
     print_counter("current ticks", interrupts::ticks());
+}
+
+fn command_gdt(_arguments: &[u8]) {
+    let snapshot = gdt::snapshot();
+
+    println("GDT/TSS/IST:");
+    print("  loaded          : ");
+    print_on_off(snapshot.loaded);
+    newline();
+    print("  code selector   : ");
+    print_hex_u64(snapshot.code_selector as u64);
+    newline();
+    print("  data selector   : ");
+    print_hex_u64(snapshot.data_selector as u64);
+    newline();
+    print("  tss selector    : ");
+    print_hex_u64(snapshot.tss_selector as u64);
+    newline();
+    print("  gdt base        : ");
+    print_hex_u64(snapshot.gdt_base);
+    newline();
+    print_counter("gdt limit", snapshot.gdt_limit as u64);
+    print("  tss base        : ");
+    print_hex_u64(snapshot.tss_base);
+    newline();
+    print_counter("tss limit", snapshot.tss_limit as u64);
+    print_counter("df ist index", snapshot.double_fault_ist_index as u64);
+    print("  df stack top    : ");
+    print_hex_u64(snapshot.double_fault_stack_top);
+    newline();
+    print("  df stack bytes  : ");
+    print_bytes(snapshot.double_fault_stack_bytes);
+    newline();
 }
 
 fn command_bench(_arguments: &[u8]) {
