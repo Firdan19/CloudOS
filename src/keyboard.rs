@@ -72,6 +72,17 @@ impl KeyBuffer {
 
         Some(event)
     }
+
+    fn len(&self) -> usize {
+        let read = self.read_index.load(Ordering::Acquire);
+        let write = self.write_index.load(Ordering::Acquire);
+
+        if write >= read {
+            write - read
+        } else {
+            KEY_BUFFER_SIZE - read + write
+        }
+    }
 }
 
 static KEY_BUFFER: KeyBuffer = KeyBuffer::new();
@@ -100,6 +111,18 @@ pub fn poll() {
 
 pub fn pop_event() -> Option<KeyEvent> {
     KEY_BUFFER.pop()
+}
+
+pub fn pending_events() -> usize {
+    KEY_BUFFER.len()
+}
+
+pub fn shift_pressed() -> bool {
+    SHIFT_PRESSED.load(Ordering::Acquire)
+}
+
+pub fn caps_lock_enabled() -> bool {
+    CAPS_LOCK.load(Ordering::Acquire)
 }
 
 fn drain_output_buffer() {

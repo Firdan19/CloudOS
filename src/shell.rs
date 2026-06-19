@@ -1,10 +1,15 @@
-use crate::keyboard::KeyEvent;
+use crate::keyboard::{self, KeyEvent};
 use crate::{interrupts, serial, vga};
 use x86_64::instructions::interrupts as cpu_interrupts;
 
 const INPUT_BUFFER_SIZE: usize = 512;
 const HISTORY_SIZE: usize = 16;
 const PIT_HZ: u64 = 18;
+const KERNEL_LOAD_BASE: u64 = 0x0010_0000;
+const IDENTITY_MAP_BYTES: u64 = 1024 * 1024 * 1024;
+const PAGE_TABLE_BYTES: u64 = 4096 * 3;
+const STACK_BYTES: u64 = 16 * 1024;
+const VGA_BUFFER_ADDRESS: u64 = 0x000b_8000;
 
 struct Command {
     name: &'static str,
@@ -12,7 +17,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 6] = [
+const COMMANDS: [Command; 10] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -42,6 +47,26 @@ const COMMANDS: [Command; 6] = [
         name: "uptime",
         description: "tampilkan tick PIT sejak boot",
         handler: command_uptime,
+    },
+    Command {
+        name: "sysinfo",
+        description: "ringkasan subsistem kernel",
+        handler: command_sysinfo,
+    },
+    Command {
+        name: "mem",
+        description: "ringkasan layout memori awal",
+        handler: command_mem,
+    },
+    Command {
+        name: "ticks",
+        description: "tampilkan tick timer mentah",
+        handler: command_ticks,
+    },
+    Command {
+        name: "keyboard",
+        description: "status input keyboard PS/2",
+        handler: command_keyboard,
     },
 ];
 
@@ -323,7 +348,7 @@ fn command_help(_arguments: &[u8]) {
     for command in COMMANDS.iter() {
         print("  ");
         print(command.name);
-        print_spaces(8usize.saturating_sub(command.name.len()));
+        print_spaces(10usize.saturating_sub(command.name.len()));
         print("- ");
         println(command.description);
     }
@@ -352,6 +377,62 @@ fn command_uptime(_arguments: &[u8]) {
     print(" (~");
     print_u64(interrupts::ticks() / PIT_HZ);
     println("s)");
+}
+
+fn command_sysinfo(_arguments: &[u8]) {
+    println("CloudOS system info:");
+    println("  version   : v0.0.5");
+    println("  arch      : x86_64 long mode");
+    println("  boot      : GRUB Multiboot2 ISO");
+    println("  console   : VGA text mode 80x25");
+    println("  irq       : IDT 256, PIC 8259 remap, PIT timer");
+    println("  keyboard  : PS/2 IRQ1 event layer");
+    println("  shell     : line editor, history, command table");
+}
+
+fn command_mem(_arguments: &[u8]) {
+    println("CloudOS memory info:");
+    print("  kernel base       : ");
+    print_hex_u64(KERNEL_LOAD_BASE);
+    newline();
+    print("  identity map      : ");
+    print_u64(IDENTITY_MAP_BYTES / 1024 / 1024);
+    println(" MiB");
+    print("  page tables       : ");
+    print_u64(PAGE_TABLE_BYTES / 1024);
+    println(" KiB");
+    print("  boot stack        : ");
+    print_u64(STACK_BYTES / 1024);
+    println(" KiB");
+    print("  vga buffer        : ");
+    print_hex_u64(VGA_BUFFER_ADDRESS);
+    newline();
+    println("  allocator         : none");
+    println("  multiboot mem map : not parsed yet");
+}
+
+fn command_ticks(_arguments: &[u8]) {
+    print("timer ticks: ");
+    print_u64(interrupts::ticks());
+    print(" at ~");
+    print_u64(PIT_HZ);
+    println(" Hz");
+}
+
+fn command_keyboard(_arguments: &[u8]) {
+    println("Keyboard status:");
+    println("  controller : PS/2");
+    println("  scancode   : set 1");
+    println("  irq        : IRQ1 / vector 33");
+    print("  shift      : ");
+    print_on_off(keyboard::shift_pressed());
+    newline();
+    print("  caps lock  : ");
+    print_on_off(keyboard::caps_lock_enabled());
+    newline();
+    print("  queued     : ");
+    print_u64(keyboard::pending_events() as u64);
+    println(" event(s)");
 }
 
 fn split_command(input: &[u8]) -> (&[u8], &[u8]) {
@@ -416,6 +497,42 @@ fn print_u64(mut value: u64) {
     for byte in digits[index..].iter().copied() {
         vga::write_byte(byte);
         serial::write_byte(byte);
+    }
+}
+
+fn print_hex_u64(value: u64) {
+    print("0x");
+
+    let mut started = false;
+    let mut shift = 60u64;
+
+    loop {
+        let nibble = ((value >> shift) & 0x0f) as u8;
+
+        if nibble != 0 || started || shift == 0 {
+            started = true;
+            let byte = if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'a' + (nibble - 10)
+            };
+            vga::write_byte(byte);
+            serial::write_byte(byte);
+        }
+
+        if shift == 0 {
+            break;
+        }
+
+        shift -= 4;
+    }
+}
+
+fn print_on_off(enabled: bool) {
+    if enabled {
+        print("on");
+    } else {
+        print("off");
     }
 }
 
