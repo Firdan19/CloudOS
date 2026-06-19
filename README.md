@@ -19,10 +19,11 @@ Tobacco adalah kernel eksperimental berbasis Rust `no_std` untuk target `x86_64-
 - Structured serial log
 - Panic screen
 - Performance counters
+- CI QEMU smoke test
 
 ## Build
 
-Build utama berjalan melalui GitHub Actions dan menghasilkan artifact `tobacco-iso`.
+Build utama berjalan melalui GitHub Actions, menjalankan QEMU smoke test headless, dan menghasilkan artifact `tobacco-iso`. Serial log smoke test disimpan sebagai artifact `tobacco-serial-log`.
 
 ## Run
 

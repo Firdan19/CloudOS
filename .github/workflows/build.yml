@@ -32,15 +32,14 @@ jobs:
       - name: Create GRUB Multiboot2 ISO
         run: grub-mkrescue -o tobacco.iso iso
       - name: Smoke test ISO boot
-        run: |
-          set +e
-          timeout 8s qemu-system-x86_64 -boot d -cdrom tobacco.iso -display none -serial file:serial.log -no-reboot -no-shutdown
-          status=$?
-          set -e
-          if [ "$status" -ne 0 ] && [ "$status" -ne 124 ]; then
-            exit "$status"
-          fi
-          grep -Fq "[boot] Tobacco v0.0.5 booting..." serial.log
+        run: sh scripts/ci-smoke-test.sh tobacco.iso serial.log 12
+      - name: Upload serial smoke log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tobacco-serial-log
+          path: serial.log
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         with:
           name: tobacco-iso

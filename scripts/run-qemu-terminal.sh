@@ -14,9 +14,11 @@ if [ ! -f tobacco.iso ]; then
 fi
 
 exec qemu-system-x86_64 \
+    -m 128M \
     -boot d \
     -cdrom tobacco.iso \
     -display curses \
     -monitor none \
+    -net none \
     -no-reboot \
     -no-shutdown

@@ -14,10 +14,12 @@ echo "Serial log: qemu-serial.log"
 echo "Stop with Ctrl-C."
 
 exec qemu-system-x86_64 \
+    -m 128M \
     -boot d \
     -cdrom tobacco.iso \
     -display none \
     -serial file:qemu-serial.log \
     -monitor none \
+    -net none \
     -no-reboot \
     -no-shutdown
