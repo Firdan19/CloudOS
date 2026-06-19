@@ -114,6 +114,54 @@ impl Writer {
         self.input_row = 0;
     }
 
+    fn show_exception_screen(
+        &mut self,
+        name: &str,
+        vector: u64,
+        error_code: u64,
+        instruction_pointer: u64,
+        fault_address: u64,
+        cpu_flags: u64,
+    ) {
+        self.hide_cursor();
+
+        for offset in 0..(VGA_WIDTH * VGA_HEIGHT) {
+            self.write_cell(offset, b' ', PANIC_BACKGROUND);
+        }
+
+        self.write_centered_color(2, "Tobacco", PANIC_BACKGROUND);
+        self.write_centered_color(3, "CPU EXCEPTION", PANIC_BACKGROUND);
+
+        self.fill_rect(5, 4, 21, 75, PANIC_PANEL);
+        self.draw_box(5, 4, 21, 75, PANIC_PANEL);
+
+        self.write_centered_in_range(7, 4, 75, name, PANIC_PANEL);
+        self.write_string_at_color(9, 8, "vector  : ", PANIC_PANEL);
+        self.write_u64_at_color(9, 18, vector, PANIC_PANEL);
+        self.write_string_at_color(10, 8, "error   : ", PANIC_PANEL);
+        self.write_hex_u64_at_color(10, 18, error_code, PANIC_PANEL);
+        self.write_string_at_color(11, 8, "rip     : ", PANIC_PANEL);
+        self.write_hex_u64_at_color(11, 18, instruction_pointer, PANIC_PANEL);
+        self.write_string_at_color(12, 8, "cr2     : ", PANIC_PANEL);
+        self.write_hex_u64_at_color(12, 18, fault_address, PANIC_PANEL);
+        self.write_string_at_color(13, 8, "rflags  : ", PANIC_PANEL);
+        self.write_hex_u64_at_color(13, 18, cpu_flags, PANIC_PANEL);
+        self.write_string_at_color(15, 8, "status  : halted", PANIC_PANEL);
+        self.write_string_at_color(16, 8, "serial  : active", PANIC_PANEL);
+        self.write_string_at_color(17, 8, "action  : close QEMU or restart VM", PANIC_PANEL);
+        self.write_string_at_color(
+            19,
+            8,
+            "Tobacco stopped to protect kernel state.",
+            PANIC_PANEL,
+        );
+        self.write_centered_color(23, "No host disk was touched.", PANIC_BACKGROUND);
+
+        self.row = 20;
+        self.column = 8;
+        self.input_row = 0;
+    }
+
     fn start_prompt(&mut self) {
         self.hide_cursor();
 
@@ -206,6 +254,66 @@ impl Writer {
 
         for (offset, byte) in s.bytes().take(max_len).enumerate() {
             self.write_cell(start + offset, vga_byte(byte), color_code);
+        }
+    }
+
+    fn write_u64_at_color(&mut self, row: usize, column: usize, mut value: u64, color_code: u8) {
+        let mut digits = [0u8; 20];
+        let mut index = digits.len();
+
+        if value == 0 {
+            self.write_cell(row * VGA_WIDTH + column, b'0', color_code);
+            return;
+        }
+
+        while value > 0 {
+            index -= 1;
+            digits[index] = b'0' + (value % 10) as u8;
+            value /= 10;
+        }
+
+        for (offset, byte) in digits[index..].iter().copied().enumerate() {
+            if column + offset >= VGA_WIDTH {
+                break;
+            }
+            self.write_cell(row * VGA_WIDTH + column + offset, byte, color_code);
+        }
+    }
+
+    fn write_hex_u64_at_color(&mut self, row: usize, column: usize, value: u64, color_code: u8) {
+        if column + 2 >= VGA_WIDTH {
+            return;
+        }
+
+        self.write_cell(row * VGA_WIDTH + column, b'0', color_code);
+        self.write_cell(row * VGA_WIDTH + column + 1, b'x', color_code);
+
+        let mut started = false;
+        let mut shift = 60u64;
+        let mut output_column = column + 2;
+
+        loop {
+            let nibble = ((value >> shift) & 0x0f) as u8;
+
+            if nibble != 0 || started || shift == 0 {
+                started = true;
+                let byte = if nibble < 10 {
+                    b'0' + nibble
+                } else {
+                    b'a' + (nibble - 10)
+                };
+
+                if output_column < VGA_WIDTH {
+                    self.write_cell(row * VGA_WIDTH + output_column, byte, color_code);
+                    output_column += 1;
+                }
+            }
+
+            if shift == 0 {
+                break;
+            }
+
+            shift -= 4;
         }
     }
 
@@ -436,6 +544,26 @@ pub fn show_splash() {
 
 pub fn show_panic_screen(title: &str, detail: &str) {
     with_writer(|writer| writer.show_panic_screen(title, detail));
+}
+
+pub fn show_exception_screen(
+    name: &str,
+    vector: u64,
+    error_code: u64,
+    instruction_pointer: u64,
+    fault_address: u64,
+    cpu_flags: u64,
+) {
+    with_writer(|writer| {
+        writer.show_exception_screen(
+            name,
+            vector,
+            error_code,
+            instruction_pointer,
+            fault_address,
+            cpu_flags,
+        )
+    });
 }
 
 pub fn start_prompt() {

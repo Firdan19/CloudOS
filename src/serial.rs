@@ -66,6 +66,16 @@ pub fn log_u64(tag: &str, label: &str, value: u64) {
     serial_print("\n");
 }
 
+pub fn log_hex_u64(tag: &str, label: &str, value: u64) {
+    serial_print("[");
+    serial_print(tag);
+    serial_print("] ");
+    serial_print(label);
+    serial_print(": ");
+    serial_print_hex_u64(value);
+    serial_print("\n");
+}
+
 pub fn log_bool(tag: &str, label: &str, enabled: bool) {
     serial_print("[");
     serial_print(tag);
@@ -107,6 +117,33 @@ fn serial_print_u64(mut value: u64) {
 
     for byte in digits[index..].iter().copied() {
         write_byte(byte);
+    }
+}
+
+fn serial_print_hex_u64(value: u64) {
+    serial_print("0x");
+
+    let mut started = false;
+    let mut shift = 60u64;
+
+    loop {
+        let nibble = ((value >> shift) & 0x0f) as u8;
+
+        if nibble != 0 || started || shift == 0 {
+            started = true;
+            let byte = if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'a' + (nibble - 10)
+            };
+            write_byte(byte);
+        }
+
+        if shift == 0 {
+            break;
+        }
+
+        shift -= 4;
     }
 }
 

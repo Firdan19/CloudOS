@@ -426,6 +426,7 @@ fn command_sysinfo(_arguments: &[u8]) {
     println("  keyboard  : PS/2 IRQ1 event layer");
     println("  boot info : Multiboot2 parser + memory map");
     println("  memory    : physical frame allocator");
+    println("  exceptions: vector-specific panic diagnostics");
     println("  shell     : line editor, history, command table");
     println("  metrics   : perf, irq, boot, bench");
 }

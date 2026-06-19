@@ -35,7 +35,39 @@ unsafe extern "C" {
     fn keyboard_interrupt_stub();
     fn default_irq_stub();
     fn default_interrupt_stub();
-    fn default_exception_with_error_stub();
+    fn exception_00_divide_error_stub();
+    fn exception_01_debug_stub();
+    fn exception_02_nmi_stub();
+    fn exception_03_breakpoint_stub();
+    fn exception_04_overflow_stub();
+    fn exception_05_bound_range_stub();
+    fn exception_06_invalid_opcode_stub();
+    fn exception_07_device_not_available_stub();
+    fn exception_08_double_fault_stub();
+    fn exception_10_invalid_tss_stub();
+    fn exception_11_segment_not_present_stub();
+    fn exception_12_stack_segment_fault_stub();
+    fn exception_13_general_protection_fault_stub();
+    fn exception_14_page_fault_stub();
+    fn exception_16_x87_floating_point_stub();
+    fn exception_17_alignment_check_stub();
+    fn exception_18_machine_check_stub();
+    fn exception_19_simd_floating_point_stub();
+    fn exception_20_virtualization_stub();
+    fn exception_21_control_protection_stub();
+    fn exception_28_hypervisor_injection_stub();
+    fn exception_29_vmm_communication_stub();
+    fn exception_30_security_stub();
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct ExceptionContext {
+    vector: u64,
+    error_code: u64,
+    instruction_pointer: u64,
+    code_segment: u64,
+    cpu_flags: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -112,10 +144,30 @@ unsafe fn init_idt() {
         }
     }
 
-    for vector in [8usize, 10, 11, 12, 13, 14, 17, 21, 29, 30] {
-        unsafe {
-            (*idt.add(vector)).set_handler(default_exception_with_error_stub);
-        }
+    unsafe {
+        (*idt.add(0)).set_handler(exception_00_divide_error_stub);
+        (*idt.add(1)).set_handler(exception_01_debug_stub);
+        (*idt.add(2)).set_handler(exception_02_nmi_stub);
+        (*idt.add(3)).set_handler(exception_03_breakpoint_stub);
+        (*idt.add(4)).set_handler(exception_04_overflow_stub);
+        (*idt.add(5)).set_handler(exception_05_bound_range_stub);
+        (*idt.add(6)).set_handler(exception_06_invalid_opcode_stub);
+        (*idt.add(7)).set_handler(exception_07_device_not_available_stub);
+        (*idt.add(8)).set_handler(exception_08_double_fault_stub);
+        (*idt.add(10)).set_handler(exception_10_invalid_tss_stub);
+        (*idt.add(11)).set_handler(exception_11_segment_not_present_stub);
+        (*idt.add(12)).set_handler(exception_12_stack_segment_fault_stub);
+        (*idt.add(13)).set_handler(exception_13_general_protection_fault_stub);
+        (*idt.add(14)).set_handler(exception_14_page_fault_stub);
+        (*idt.add(16)).set_handler(exception_16_x87_floating_point_stub);
+        (*idt.add(17)).set_handler(exception_17_alignment_check_stub);
+        (*idt.add(18)).set_handler(exception_18_machine_check_stub);
+        (*idt.add(19)).set_handler(exception_19_simd_floating_point_stub);
+        (*idt.add(20)).set_handler(exception_20_virtualization_stub);
+        (*idt.add(21)).set_handler(exception_21_control_protection_stub);
+        (*idt.add(28)).set_handler(exception_28_hypervisor_injection_stub);
+        (*idt.add(29)).set_handler(exception_29_vmm_communication_stub);
+        (*idt.add(30)).set_handler(exception_30_security_stub);
     }
 
     for vector in PIC_1_OFFSET as usize..(PIC_2_OFFSET as usize + 8) {
@@ -234,12 +286,90 @@ pub extern "C" fn default_irq_handler() {
 }
 
 #[no_mangle]
-pub extern "C" fn exception_handler() {
+pub extern "C" fn exception_dispatch_handler(context: *const ExceptionContext) -> ! {
     stats::inc_exception();
     cpu_interrupts::disable();
-    serial::log("panic", "CPU fault captured");
-    vga::show_panic_screen("CPU fault captured", "processor exception handler invoked");
+
+    let context = unsafe { *context };
+    let fault_address = if context.vector == 14 { read_cr2() } else { 0 };
+    let name = exception_name(context.vector);
+
+    serial::log("panic", "CPU exception captured");
+    serial::log("panic", name);
+    serial::log_u64("panic", "exception vector", context.vector);
+    serial::log_hex_u64("panic", "error code", context.error_code);
+    serial::log_hex_u64("panic", "rip", context.instruction_pointer);
+    serial::log_hex_u64("panic", "cs", context.code_segment);
+    serial::log_hex_u64("panic", "rflags", context.cpu_flags);
+
+    if context.vector == 14 {
+        serial::log_hex_u64("panic", "cr2", fault_address);
+        log_page_fault_bits(context.error_code);
+    }
+
+    vga::show_exception_screen(
+        name,
+        context.vector,
+        context.error_code,
+        context.instruction_pointer,
+        fault_address,
+        context.cpu_flags,
+    );
+
     loop {
         x86_64::instructions::hlt();
     }
+}
+
+fn exception_name(vector: u64) -> &'static str {
+    match vector {
+        0 => "Divide Error",
+        1 => "Debug Exception",
+        2 => "Non-Maskable Interrupt",
+        3 => "Breakpoint",
+        4 => "Overflow",
+        5 => "BOUND Range Exceeded",
+        6 => "Invalid Opcode",
+        7 => "Device Not Available",
+        8 => "Double Fault",
+        10 => "Invalid TSS",
+        11 => "Segment Not Present",
+        12 => "Stack Segment Fault",
+        13 => "General Protection Fault",
+        14 => "Page Fault",
+        16 => "x87 Floating-Point Exception",
+        17 => "Alignment Check",
+        18 => "Machine Check",
+        19 => "SIMD Floating-Point Exception",
+        20 => "Virtualization Exception",
+        21 => "Control Protection Exception",
+        28 => "Hypervisor Injection Exception",
+        29 => "VMM Communication Exception",
+        30 => "Security Exception",
+        254 => "CPU Exception With Error Code",
+        255 => "Unknown CPU Interrupt",
+        _ => "CPU Exception",
+    }
+}
+
+fn log_page_fault_bits(error_code: u64) {
+    serial::log_bool("panic", "page present", error_code & (1 << 0) != 0);
+    serial::log_bool("panic", "page write", error_code & (1 << 1) != 0);
+    serial::log_bool("panic", "page user", error_code & (1 << 2) != 0);
+    serial::log_bool("panic", "page reserved", error_code & (1 << 3) != 0);
+    serial::log_bool("panic", "page instruction", error_code & (1 << 4) != 0);
+}
+
+fn read_cr2() -> u64 {
+    let value: u64;
+
+    unsafe {
+        core::arch::asm!(
+            "mov {}, cr2",
+            out(reg) value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+
+    value
 }
