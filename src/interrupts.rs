@@ -234,7 +234,7 @@ pub extern "C" fn default_irq_handler() {
 pub extern "C" fn exception_handler() {
     cpu_interrupts::disable();
     serial::log("panic", "CPU fault captured");
-    vga::write_string("\nCPU fault captured. System halted.");
+    vga::show_panic_screen("CPU fault captured", "processor exception handler invoked");
     loop {
         x86_64::instructions::hlt();
     }

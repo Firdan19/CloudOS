@@ -136,8 +136,8 @@ pub extern "C" fn kernel_main() -> ! {
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     cpu_interrupts::disable();
-    vga::write_string("\nPANIC");
     serial::log("panic", "kernel panic; system halted");
+    vga::show_panic_screen("Rust panic handler", "kernel panic handler invoked");
     halt_loop();
 }
 

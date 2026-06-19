@@ -7,6 +7,8 @@ const MUTED_ON_LIGHT: u8 = 0x78;
 const ACCENT_ON_LIGHT: u8 = 0x71;
 const BAR_COLOR: u8 = 0x17;
 const CURSOR_COLOR: u8 = 0x07;
+const PANIC_BACKGROUND: u8 = 0x4f;
+const PANIC_PANEL: u8 = 0x0f;
 const VGA_WIDTH: usize = 80;
 const VGA_HEIGHT: usize = 25;
 const CONSOLE_TOP: usize = 8;
@@ -78,6 +80,38 @@ impl Writer {
         self.set_cursor(CONSOLE_TOP, CONSOLE_LEFT);
     }
 
+    fn show_panic_screen(&mut self, title: &str, detail: &str) {
+        self.hide_cursor();
+
+        for offset in 0..(VGA_WIDTH * VGA_HEIGHT) {
+            self.write_cell(offset, b' ', PANIC_BACKGROUND);
+        }
+
+        self.write_centered_color(2, "CloudOS", PANIC_BACKGROUND);
+        self.write_centered_color(3, "KERNEL PANIC", PANIC_BACKGROUND);
+
+        self.fill_rect(5, 6, 19, 73, PANIC_PANEL);
+        self.draw_box(5, 6, 19, 73, PANIC_PANEL);
+
+        self.write_centered_in_range(7, 6, 73, title, PANIC_PANEL);
+        self.write_string_at_color(9, 10, "error   : ", PANIC_PANEL);
+        self.write_string_at_color(9, 20, detail, PANIC_PANEL);
+        self.write_string_at_color(11, 10, "status  : halted", PANIC_PANEL);
+        self.write_string_at_color(12, 10, "serial  : active", PANIC_PANEL);
+        self.write_string_at_color(13, 10, "action  : close QEMU or restart VM", PANIC_PANEL);
+        self.write_string_at_color(
+            16,
+            10,
+            "CloudOS stopped to protect kernel state.",
+            PANIC_PANEL,
+        );
+        self.write_centered_color(21, "No host disk was touched.", PANIC_BACKGROUND);
+
+        self.row = 18;
+        self.column = 10;
+        self.input_row = 0;
+    }
+
     fn start_prompt(&mut self) {
         self.hide_cursor();
 
@@ -141,6 +175,25 @@ impl Writer {
         self.write_string_at_color(row, column, s, color_code);
     }
 
+    fn write_centered_in_range(
+        &mut self,
+        row: usize,
+        left: usize,
+        right: usize,
+        s: &str,
+        color_code: u8,
+    ) {
+        if left > right || right >= VGA_WIDTH {
+            return;
+        }
+
+        let range_width = right - left + 1;
+        let width = s.bytes().count().min(range_width);
+        let column = left + ((range_width - width) / 2);
+
+        self.write_string_at_color(row, column, s, color_code);
+    }
+
     fn write_string_at_color(&mut self, row: usize, column: usize, s: &str, color_code: u8) {
         if row >= VGA_HEIGHT || column >= VGA_WIDTH {
             return;
@@ -187,6 +240,31 @@ impl Writer {
             self.write_cell(row * VGA_WIDTH + PANEL_RIGHT, b'|', MUTED_ON_LIGHT);
             self.clear_console_row(row);
         }
+    }
+
+    fn fill_rect(&self, top: usize, left: usize, bottom: usize, right: usize, color_code: u8) {
+        for row in top..=bottom {
+            for column in left..=right {
+                self.write_cell(row * VGA_WIDTH + column, b' ', color_code);
+            }
+        }
+    }
+
+    fn draw_box(&self, top: usize, left: usize, bottom: usize, right: usize, color_code: u8) {
+        for column in left..=right {
+            self.write_cell(top * VGA_WIDTH + column, b'-', color_code);
+            self.write_cell(bottom * VGA_WIDTH + column, b'-', color_code);
+        }
+
+        for row in top..=bottom {
+            self.write_cell(row * VGA_WIDTH + left, b'|', color_code);
+            self.write_cell(row * VGA_WIDTH + right, b'|', color_code);
+        }
+
+        self.write_cell(top * VGA_WIDTH + left, b'+', color_code);
+        self.write_cell(top * VGA_WIDTH + right, b'+', color_code);
+        self.write_cell(bottom * VGA_WIDTH + left, b'+', color_code);
+        self.write_cell(bottom * VGA_WIDTH + right, b'+', color_code);
     }
 
     fn set_cursor(&mut self, row: usize, column: usize) {
@@ -349,6 +427,10 @@ pub fn init() {
 
 pub fn show_splash() {
     with_writer(|writer| writer.show_splash());
+}
+
+pub fn show_panic_screen(title: &str, detail: &str) {
+    with_writer(|writer| writer.show_panic_screen(title, detail));
 }
 
 pub fn start_prompt() {
