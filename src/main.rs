@@ -9,6 +9,7 @@ mod gdt;
 mod interrupts;
 mod keyboard;
 mod multiboot;
+mod paging;
 mod physmem;
 mod serial;
 mod shell;
@@ -28,7 +29,7 @@ _start:
     movl $stack_top, %esp
     xorl %ebp, %ebp
 
-    movl $p2_table, %edi
+    movl $boot_p2_table, %edi
     xorl %eax, %eax
     movl $512, %ecx
 1:
@@ -41,17 +42,17 @@ _start:
     incl %eax
     loop 1b
 
-    movl $p2_table, %eax
+    movl $boot_p2_table, %eax
     orl $0x03, %eax
-    movl %eax, p3_table
-    movl $0, p3_table+4
+    movl %eax, boot_p3_table
+    movl $0, boot_p3_table+4
 
-    movl $p3_table, %eax
+    movl $boot_p3_table, %eax
     orl $0x03, %eax
-    movl %eax, p4_table
-    movl $0, p4_table+4
+    movl %eax, boot_p4_table
+    movl $0, boot_p4_table+4
 
-    movl $p4_table, %eax
+    movl $boot_p4_table, %eax
     movl %eax, %cr3
 
     movl %cr4, %eax
@@ -112,11 +113,14 @@ gdt_descriptor:
 
     .section .bss
     .align 4096
-p4_table:
+    .global boot_p4_table
+boot_p4_table:
     .skip 4096
-p3_table:
+    .global boot_p3_table
+boot_p3_table:
     .skip 4096
-p2_table:
+    .global boot_p2_table
+boot_p2_table:
     .skip 4096
     .align 4
 multiboot_magic:
@@ -156,6 +160,12 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info_addr: u32) ->
     );
     let frame_allocator = physmem::init();
     serial::log_u64("mem", "free frames", frame_allocator.free_frames);
+    let paging_state = paging::init();
+    serial::log_u64(
+        "paging",
+        "identity mapped bytes",
+        paging_state.identity_mapped_bytes,
+    );
 
     vga::init();
     vga::show_splash();

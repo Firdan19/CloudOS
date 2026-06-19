@@ -1,12 +1,10 @@
 use crate::keyboard::{self, KeyEvent};
-use crate::{gdt, interrupts, multiboot, physmem, serial, stats, vga};
+use crate::{gdt, interrupts, multiboot, paging, physmem, serial, stats, vga};
 use x86_64::instructions::interrupts as cpu_interrupts;
 
 const INPUT_BUFFER_SIZE: usize = 512;
 const HISTORY_SIZE: usize = 16;
 const PIT_HZ: u64 = 18;
-const IDENTITY_MAP_BYTES: u64 = 1024 * 1024 * 1024;
-const PAGE_TABLE_BYTES: u64 = 4096 * 3;
 const STACK_BYTES: u64 = 16 * 1024;
 const VGA_BUFFER_ADDRESS: u64 = 0x000b_8000;
 
@@ -16,7 +14,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 18] = [
+const COMMANDS: [Command; 20] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -101,6 +99,16 @@ const COMMANDS: [Command; 18] = [
         name: "gdt",
         description: "status GDT, TSS, dan IST",
         handler: command_gdt,
+    },
+    Command {
+        name: "paging",
+        description: "status page table boot",
+        handler: command_paging,
+    },
+    Command {
+        name: "virt",
+        description: "translate virtual address",
+        handler: command_virt,
     },
     Command {
         name: "bench",
@@ -431,6 +439,7 @@ fn command_sysinfo(_arguments: &[u8]) {
     println("  keyboard  : PS/2 IRQ1 event layer");
     println("  boot info : Multiboot2 parser + memory map");
     println("  memory    : physical frame allocator");
+    println("  paging    : boot identity map inspector");
     println("  gdt/tss   : double fault IST stack");
     println("  exceptions: vector-specific panic diagnostics");
     println("  shell     : line editor, history, command table");
@@ -450,7 +459,7 @@ fn command_mem(_arguments: &[u8]) {
     print_hex_u64(frames.kernel_end);
     newline();
     print("  identity map      : ");
-    print_u64(IDENTITY_MAP_BYTES / 1024 / 1024);
+    print_u64(paging::BOOT_IDENTITY_MAP_BYTES / 1024 / 1024);
     println(" MiB");
     print("  multiboot parsed  : ");
     print_on_off(boot_info.parsed);
@@ -504,7 +513,7 @@ fn command_mem(_arguments: &[u8]) {
     }
 
     print("  page tables       : ");
-    print_u64(PAGE_TABLE_BYTES / 1024);
+    print_u64(paging::PAGE_TABLE_MEMORY_BYTES / 1024);
     println(" KiB");
     print("  boot stack        : ");
     print_u64(STACK_BYTES / 1024);
@@ -671,13 +680,16 @@ fn command_boot(_arguments: &[u8]) {
     let boot_info = multiboot::summary();
     let frames = physmem::snapshot();
     let gdt = gdt::snapshot();
+    let paging = paging::snapshot();
 
     println("Boot status:");
     println("  name          : Tobacco");
     println("  version       : v0.0.5");
     println("  mode          : x86_64 long mode");
     println("  boot          : GRUB Multiboot2 ISO");
-    println("  page map      : 1 GiB identity map");
+    print("  page map      : ");
+    print_u64(paging.identity_mapped_bytes / 1024 / 1024);
+    println(" MiB identity map");
     println("  serial log    : structured tags active");
     print("  mb2 magic     : ");
     print_on_off(boot_info.valid_magic);
@@ -704,6 +716,9 @@ fn command_boot(_arguments: &[u8]) {
     newline();
     print("  gdt/tss       : ");
     print_on_off(gdt.loaded);
+    newline();
+    print("  paging        : ");
+    print_on_off(paging.initialized);
     newline();
     print_counter("free frames", frames.free_frames);
     print_counter("shell ready tick", snapshot.shell_ready_tick);
@@ -741,6 +756,76 @@ fn command_gdt(_arguments: &[u8]) {
     print("  df stack bytes  : ");
     print_bytes(snapshot.double_fault_stack_bytes);
     newline();
+}
+
+fn command_paging(_arguments: &[u8]) {
+    let snapshot = paging::snapshot();
+
+    println("Paging:");
+    print("  initialized       : ");
+    print_on_off(snapshot.initialized);
+    newline();
+    print("  cr3               : ");
+    print_hex_u64(snapshot.cr3);
+    newline();
+    print("  p4 table          : ");
+    print_hex_u64(snapshot.p4_addr);
+    newline();
+    print("  p3 table          : ");
+    print_hex_u64(snapshot.p3_addr);
+    newline();
+    print("  p2 table          : ");
+    print_hex_u64(snapshot.p2_addr);
+    newline();
+    print_counter("p4 present", snapshot.p4_present_entries);
+    print_counter("p3 present", snapshot.p3_present_entries);
+    print_counter("p2 present", snapshot.p2_present_entries);
+    print_counter("huge pages", snapshot.huge_pages);
+    print("  identity mapped   : ");
+    print_bytes(snapshot.identity_mapped_bytes);
+    newline();
+    print("  page table memory : ");
+    print_bytes(snapshot.page_table_bytes);
+    newline();
+}
+
+fn command_virt(arguments: &[u8]) {
+    let arguments = trim_ascii(arguments);
+
+    if arguments.is_empty() {
+        println("Usage: virt <address>");
+        println("Example: virt 0xb8000");
+        return;
+    }
+
+    match parse_u64(arguments) {
+        Some(address) => {
+            let result = paging::translate(address);
+            serial::log_hex_u64("paging", "translate virt", result.virt);
+
+            if result.mapped {
+                serial::log_hex_u64("paging", "translate phys", result.phys);
+                print("virt ");
+                print_hex_u64(result.virt);
+                print(" -> phys ");
+                print_hex_u64(result.phys);
+                print(" (");
+                print_bytes(result.page_size);
+                if result.huge_page {
+                    print(" huge page");
+                }
+                println(")");
+            } else {
+                print("virt ");
+                print_hex_u64(result.virt);
+                println(" belum terpetakan di boot identity map.");
+            }
+        }
+        None => {
+            stats::inc_shell_error();
+            println("Alamat tidak valid. Gunakan decimal atau hex, contoh: virt 0xb8000");
+        }
+    }
 }
 
 fn command_bench(_arguments: &[u8]) {
@@ -910,6 +995,57 @@ fn trim_ascii(mut input: &[u8]) -> &[u8] {
     }
 
     input
+}
+
+fn parse_u64(input: &[u8]) -> Option<u64> {
+    let input = trim_ascii(input);
+
+    if input.is_empty() {
+        return None;
+    }
+
+    let (digits, base) = if input.len() > 2 && input[0] == b'0' && to_ascii_lower(input[1]) == b'x'
+    {
+        (&input[2..], 16u64)
+    } else {
+        (input, 10u64)
+    };
+
+    if digits.is_empty() {
+        return None;
+    }
+
+    let mut value = 0u64;
+    let mut parsed_digit = false;
+
+    for byte in digits.iter().copied() {
+        if byte == b'_' {
+            continue;
+        }
+
+        let digit = ascii_digit_value(byte)?;
+        if digit >= base {
+            return None;
+        }
+
+        value = value.checked_mul(base)?.checked_add(digit)?;
+        parsed_digit = true;
+    }
+
+    if parsed_digit {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn ascii_digit_value(byte: u8) -> Option<u64> {
+    match byte {
+        b'0'..=b'9' => Some((byte - b'0') as u64),
+        b'a'..=b'f' => Some((byte - b'a' + 10) as u64),
+        b'A'..=b'F' => Some((byte - b'A' + 10) as u64),
+        _ => None,
+    }
 }
 
 fn eq_ignore_ascii_case(left: &[u8], right: &[u8]) -> bool {
