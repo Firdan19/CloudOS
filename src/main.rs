@@ -7,6 +7,7 @@ use x86_64::instructions::interrupts as cpu_interrupts;
 
 mod interrupts;
 mod keyboard;
+mod multiboot;
 mod serial;
 mod shell;
 mod stats;
@@ -20,6 +21,8 @@ core::arch::global_asm!(
     .global _start
 _start:
     cli
+    movl %eax, multiboot_magic
+    movl %ebx, multiboot_info_addr
     movl $stack_top, %esp
     xorl %ebp, %ebp
 
@@ -86,6 +89,8 @@ long_mode_start:
 
     leaq stack_top(%rip), %rsp
     xorq %rbp, %rbp
+    movl multiboot_magic(%rip), %edi
+    movl multiboot_info_addr(%rip), %esi
     call kernel_main
 
 .halt:
@@ -111,6 +116,11 @@ p3_table:
     .skip 4096
 p2_table:
     .skip 4096
+    .align 4
+multiboot_magic:
+    .skip 4
+multiboot_info_addr:
+    .skip 4
     .align 16
 stack_bottom:
     .skip 16384
@@ -119,9 +129,19 @@ stack_top:
 );
 
 #[no_mangle]
-pub extern "C" fn kernel_main() -> ! {
+pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info_addr: u32) -> ! {
     serial::init();
     serial::log("boot", "Tobacco v0.0.5 booting...");
+    let boot_info = multiboot::init(multiboot_magic, multiboot_info_addr as u64);
+    serial::log_bool("boot", "multiboot magic", boot_info.valid_magic);
+    serial::log_u64("boot", "multiboot info addr", boot_info.address);
+    serial::log_u64("boot", "multiboot tags", boot_info.tag_count as u64);
+    serial::log_u64("mem", "usable bytes", boot_info.memory.usable_bytes);
+    serial::log_u64(
+        "mem",
+        "memory regions",
+        boot_info.memory.region_count as u64,
+    );
 
     vga::init();
     vga::show_splash();

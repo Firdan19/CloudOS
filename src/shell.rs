@@ -1,5 +1,5 @@
 use crate::keyboard::{self, KeyEvent};
-use crate::{interrupts, serial, stats, vga};
+use crate::{interrupts, multiboot, serial, stats, vga};
 use x86_64::instructions::interrupts as cpu_interrupts;
 
 const INPUT_BUFFER_SIZE: usize = 512;
@@ -17,7 +17,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 14] = [
+const COMMANDS: [Command; 15] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -55,8 +55,13 @@ const COMMANDS: [Command; 14] = [
     },
     Command {
         name: "mem",
-        description: "ringkasan layout memori awal",
+        description: "ringkasan memori dari Multiboot2",
         handler: command_mem,
+    },
+    Command {
+        name: "memmap",
+        description: "daftar region memory map",
+        handler: command_memmap,
     },
     Command {
         name: "ticks",
@@ -410,11 +415,15 @@ fn command_sysinfo(_arguments: &[u8]) {
     println("  console   : VGA text mode 80x25");
     println("  irq       : IDT 256, PIC 8259 remap, PIT timer");
     println("  keyboard  : PS/2 IRQ1 event layer");
+    println("  boot info : Multiboot2 parser + memory map");
     println("  shell     : line editor, history, command table");
     println("  metrics   : perf, irq, boot, bench");
 }
 
 fn command_mem(_arguments: &[u8]) {
+    let boot_info = multiboot::summary();
+    let memory = boot_info.memory;
+
     println("Tobacco memory info:");
     print("  kernel base       : ");
     print_hex_u64(KERNEL_LOAD_BASE);
@@ -422,6 +431,57 @@ fn command_mem(_arguments: &[u8]) {
     print("  identity map      : ");
     print_u64(IDENTITY_MAP_BYTES / 1024 / 1024);
     println(" MiB");
+    print("  multiboot parsed  : ");
+    print_on_off(boot_info.parsed);
+    newline();
+    print("  boot info addr    : ");
+    print_hex_u64(boot_info.address);
+    newline();
+
+    if memory.has_basic_memory {
+        print("  lower memory      : ");
+        print_u64(memory.mem_lower_kib as u64);
+        println(" KiB");
+        print("  upper memory      : ");
+        print_u64(memory.mem_upper_kib as u64);
+        println(" KiB");
+    } else {
+        println("  basic meminfo     : unavailable");
+    }
+
+    if memory.has_memory_map {
+        print("  memory map        : ");
+        print_u64(memory.region_count as u64);
+        println(" region(s)");
+        print("  usable RAM        : ");
+        print_bytes(memory.usable_bytes);
+        newline();
+        print("  reserved RAM      : ");
+        print_bytes(memory.reserved_bytes);
+        newline();
+        print("  ACPI RAM          : ");
+        print_bytes(memory.acpi_bytes);
+        newline();
+        print("  bad RAM           : ");
+        print_bytes(memory.bad_bytes);
+        newline();
+        print("  highest address   : ");
+        print_hex_u64(memory.highest_address);
+        newline();
+        print("  first usable      : ");
+        print_hex_u64(memory.first_usable_base);
+        print(" / ");
+        print_bytes(memory.first_usable_length);
+        newline();
+        print("  largest usable    : ");
+        print_hex_u64(memory.largest_usable_base);
+        print(" / ");
+        print_bytes(memory.largest_usable_length);
+        newline();
+    } else {
+        println("  memory map        : unavailable");
+    }
+
     print("  page tables       : ");
     print_u64(PAGE_TABLE_BYTES / 1024);
     println(" KiB");
@@ -432,7 +492,40 @@ fn command_mem(_arguments: &[u8]) {
     print_hex_u64(VGA_BUFFER_ADDRESS);
     newline();
     println("  allocator         : none");
-    println("  multiboot mem map : not parsed yet");
+    println("  next              : frame allocator");
+}
+
+fn command_memmap(_arguments: &[u8]) {
+    let boot_info = multiboot::summary();
+    let memory = boot_info.memory;
+
+    if !memory.has_memory_map {
+        println("Memory map tidak tersedia dari bootloader.");
+        return;
+    }
+
+    println("Memory map:");
+
+    for index in 0..multiboot::stored_region_count() {
+        if let Some(region) = multiboot::region(index) {
+            print("  ");
+            print_u64(index as u64);
+            print(": base ");
+            print_hex_u64(region.base_addr);
+            print(" len ");
+            print_bytes(region.length);
+            print(" ");
+            println(region.type_name());
+        }
+    }
+
+    if memory.region_count > memory.stored_region_count {
+        print("  stored first ");
+        print_u64(memory.stored_region_count as u64);
+        print(" of ");
+        print_u64(memory.region_count as u64);
+        println(" region(s)");
+    }
 }
 
 fn command_ticks(_arguments: &[u8]) {
@@ -492,6 +585,7 @@ fn command_irq(_arguments: &[u8]) {
 
 fn command_boot(_arguments: &[u8]) {
     let snapshot = stats::snapshot();
+    let boot_info = multiboot::summary();
 
     println("Boot status:");
     println("  name          : Tobacco");
@@ -500,6 +594,26 @@ fn command_boot(_arguments: &[u8]) {
     println("  boot          : GRUB Multiboot2 ISO");
     println("  page map      : 1 GiB identity map");
     println("  serial log    : structured tags active");
+    print("  mb2 magic     : ");
+    print_on_off(boot_info.valid_magic);
+    newline();
+    print("  mb2 parsed    : ");
+    print_on_off(boot_info.parsed);
+    newline();
+    print("  mb2 addr      : ");
+    print_hex_u64(boot_info.address);
+    newline();
+    print("  mb2 tags      : ");
+    print_u64(boot_info.tag_count as u64);
+    newline();
+    if !boot_info.bootloader_name.as_str().is_empty() {
+        print("  bootloader    : ");
+        println(boot_info.bootloader_name.as_str());
+    }
+    if !boot_info.command_line.as_str().is_empty() {
+        print("  command line  : ");
+        println(boot_info.command_line.as_str());
+    }
     print_counter("shell ready tick", snapshot.shell_ready_tick);
     print_counter("current ticks", interrupts::ticks());
 }
@@ -566,6 +680,19 @@ fn print_counter(label: &str, value: u64) {
     print(": ");
     print_u64(value);
     newline();
+}
+
+fn print_bytes(bytes: u64) {
+    if bytes >= 1024 * 1024 {
+        print_u64(bytes / 1024 / 1024);
+        print(" MiB");
+    } else if bytes >= 1024 {
+        print_u64(bytes / 1024);
+        print(" KiB");
+    } else {
+        print_u64(bytes);
+        print(" B");
+    }
 }
 
 fn print_ascii_line(bytes: &[u8]) {
