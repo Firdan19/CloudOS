@@ -120,12 +120,14 @@ stack_top:
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
     serial::init();
-    serial::serial_println("[boot] CloudOS v0.0.5 booting...");
+    serial::log("boot", "CloudOS v0.0.5 booting...");
 
     vga::init();
     vga::show_splash();
+    serial::log("boot", "vga text console ready");
 
     keyboard::init();
+    serial::log("keyboard", "ps/2 controller drained");
     interrupts::init();
 
     shell::run();
@@ -135,7 +137,7 @@ pub extern "C" fn kernel_main() -> ! {
 fn panic(_info: &PanicInfo) -> ! {
     cpu_interrupts::disable();
     vga::write_string("\nPANIC");
-    serial::serial_println("PANIC");
+    serial::log("panic", "kernel panic; system halted");
     halt_loop();
 }
 

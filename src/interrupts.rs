@@ -88,7 +88,7 @@ pub fn init() {
     }
 
     cpu_interrupts::enable();
-    serial::serial_println("[irq] idt, pic, pit ready");
+    serial::log("irq", "idt, pic, pit ready");
 }
 
 pub fn pop_key_event() -> Option<KeyEvent> {
@@ -233,7 +233,7 @@ pub extern "C" fn default_irq_handler() {
 #[no_mangle]
 pub extern "C" fn exception_handler() {
     cpu_interrupts::disable();
-    serial::serial_println("[panic] CPU fault captured");
+    serial::log("panic", "CPU fault captured");
     vga::write_string("\nCPU fault captured. System halted.");
     loop {
         x86_64::instructions::hlt();

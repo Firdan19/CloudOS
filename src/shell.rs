@@ -199,7 +199,7 @@ pub fn run() -> ! {
                     input_len = 0;
                     cursor = 0;
                     history_selected = None;
-                    serial::serial_println("^esc");
+                    serial::log("shell", "input cleared by escape");
                     vga::render_input_with_cursor(&input[..input_len], cursor);
                 }
                 KeyEvent::Tab => {
@@ -249,11 +249,7 @@ pub fn run() -> ! {
                 }
                 KeyEvent::ShiftPressed | KeyEvent::ShiftReleased => {}
                 KeyEvent::CapsLockToggled(enabled) => {
-                    if enabled {
-                        serial::serial_println("[keyboard] caps lock on");
-                    } else {
-                        serial::serial_println("[keyboard] caps lock off");
-                    }
+                    serial::log_bool("keyboard", "caps lock", enabled);
                 }
                 KeyEvent::Char(_) => {}
             }
@@ -324,21 +320,22 @@ fn execute(input: &[u8]) {
     let command_line = trim_ascii(input);
 
     if command_line.is_empty() {
+        serial::log("shell", "empty command ignored");
         return;
     }
 
     let (command, arguments) = split_command(command_line);
-    serial::serial_print("[shell] command: ");
-    serial::serial_print_bytes(command);
-    serial::serial_println("");
+    serial::log_bytes("shell", "command", command);
 
     for command_entry in COMMANDS.iter() {
         if eq_ignore_ascii_case(command, command_entry.name.as_bytes()) {
+            serial::log_bytes("shell", "handler", command_entry.name.as_bytes());
             (command_entry.handler)(arguments);
             return;
         }
     }
 
+    serial::log_bytes("shell", "unknown command", command);
     println("Perintah tidak dikenal. Ketik help.");
 }
 
@@ -355,7 +352,7 @@ fn command_help(_arguments: &[u8]) {
 }
 
 fn command_clear(_arguments: &[u8]) {
-    serial::serial_println("clear");
+    serial::log("shell", "clear screen requested");
     vga::show_splash();
 }
 
@@ -372,6 +369,7 @@ fn command_echo(arguments: &[u8]) {
 }
 
 fn command_uptime(_arguments: &[u8]) {
+    serial::log_u64("shell", "uptime ticks", interrupts::ticks());
     print("uptime ticks: ");
     print_u64(interrupts::ticks());
     print(" (~");
@@ -412,6 +410,7 @@ fn command_mem(_arguments: &[u8]) {
 }
 
 fn command_ticks(_arguments: &[u8]) {
+    serial::log_u64("shell", "timer ticks", interrupts::ticks());
     print("timer ticks: ");
     print_u64(interrupts::ticks());
     print(" at ~");

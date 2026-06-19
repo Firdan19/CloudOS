@@ -38,6 +38,47 @@ pub fn serial_println(s: &str) {
     serial_print("\n");
 }
 
+pub fn log(tag: &str, message: &str) {
+    serial_print("[");
+    serial_print(tag);
+    serial_print("] ");
+    serial_println(message);
+}
+
+pub fn log_bytes(tag: &str, label: &str, bytes: &[u8]) {
+    serial_print("[");
+    serial_print(tag);
+    serial_print("] ");
+    serial_print(label);
+    serial_print(": ");
+    serial_print_bytes(bytes);
+    serial_print("\n");
+}
+
+pub fn log_u64(tag: &str, label: &str, value: u64) {
+    serial_print("[");
+    serial_print(tag);
+    serial_print("] ");
+    serial_print(label);
+    serial_print(": ");
+    serial_print_u64(value);
+    serial_print("\n");
+}
+
+pub fn log_bool(tag: &str, label: &str, enabled: bool) {
+    serial_print("[");
+    serial_print(tag);
+    serial_print("] ");
+    serial_print(label);
+    serial_print(": ");
+    if enabled {
+        serial_print("on");
+    } else {
+        serial_print("off");
+    }
+    serial_print("\n");
+}
+
 pub fn write_byte(byte: u8) {
     cpu_interrupts::without_interrupts(|| match byte {
         b'\n' => {
@@ -46,6 +87,26 @@ pub fn write_byte(byte: u8) {
         }
         byte => write_raw_byte(byte),
     });
+}
+
+fn serial_print_u64(mut value: u64) {
+    let mut digits = [0u8; 20];
+    let mut index = digits.len();
+
+    if value == 0 {
+        write_byte(b'0');
+        return;
+    }
+
+    while value > 0 {
+        index -= 1;
+        digits[index] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+
+    for byte in digits[index..].iter().copied() {
+        write_byte(byte);
+    }
 }
 
 fn write_raw_byte(byte: u8) {
