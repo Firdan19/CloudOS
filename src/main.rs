@@ -13,6 +13,7 @@ mod keyboard;
 mod klog;
 mod multiboot;
 mod paging;
+mod paniclog;
 mod physmem;
 mod serial;
 mod shell;
@@ -190,6 +191,7 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info_addr: u32) ->
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     cpu_interrupts::disable();
+    paniclog::record_rust_panic("kernel panic handler invoked");
     serial::log("panic", "kernel panic; system halted");
     vga::show_panic_screen("Rust panic handler", "kernel panic handler invoked");
     halt_loop();

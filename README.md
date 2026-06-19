@@ -21,6 +21,7 @@ Tobacco adalah kernel eksperimental berbasis Rust `no_std` untuk target `x86_64-
 - Command table
 - Console stress checks
 - System info commands
+- Health, diagnostics, buildinfo, and lastpanic commands
 - Structured serial log
 - Kernel log ring buffer
 - Selftest command

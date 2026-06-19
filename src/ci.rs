@@ -83,6 +83,11 @@ fn halt_forever() -> ! {
 fn run_command_table_checks() {
     serial::log_u64("ci", "command table count", shell::command_count() as u64);
     check("command help", shell::command_exists(b"help"));
+    check("command health", shell::command_exists(b"health"));
+    check("command diag", shell::command_exists(b"diag"));
+    check("command lastpanic", shell::command_exists(b"lastpanic"));
+    check("command buildinfo", shell::command_exists(b"buildinfo"));
+    check("command uptime", shell::command_exists(b"uptime"));
     check("command selftest", shell::command_exists(b"selftest"));
     check("command stress", shell::command_exists(b"stress"));
     check("command paging", shell::command_exists(b"paging"));
@@ -179,7 +184,7 @@ fn run_selftest_checks() -> bool {
         "selftest keyboard queue sane",
         keyboard::pending_events() < 256,
     );
-    ok &= check("selftest command table sane", shell::command_count() >= 27);
+    ok &= check("selftest command table sane", shell::command_count() >= 32);
 
     ok
 }

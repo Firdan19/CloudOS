@@ -1,5 +1,5 @@
 use crate::keyboard::KeyEvent;
-use crate::{gdt, keyboard, paging, serial, stats, vga};
+use crate::{gdt, keyboard, paging, paniclog, serial, stats, vga};
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::instructions::interrupts as cpu_interrupts;
@@ -297,6 +297,15 @@ pub extern "C" fn exception_dispatch_handler(context: *const ExceptionContext) -
     let context = unsafe { *context };
     let fault_address = if context.vector == 14 { read_cr2() } else { 0 };
     let name = exception_name(context.vector);
+
+    paniclog::record_exception(
+        name,
+        context.vector,
+        context.error_code,
+        context.instruction_pointer,
+        fault_address,
+        context.cpu_flags,
+    );
 
     serial::log("panic", "CPU exception captured");
     serial::log("panic", name);

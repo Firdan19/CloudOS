@@ -1,5 +1,7 @@
 use crate::keyboard::{self, KeyEvent};
-use crate::{gdt, heap, interrupts, klog, multiboot, paging, physmem, serial, stats, vga};
+use crate::{
+    gdt, heap, interrupts, klog, multiboot, paging, paniclog, physmem, serial, stats, vga,
+};
 use x86_64::instructions::interrupts as cpu_interrupts;
 
 const INPUT_BUFFER_SIZE: usize = 512;
@@ -16,7 +18,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 27] = [
+const COMMANDS: [Command; 32] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -44,8 +46,28 @@ const COMMANDS: [Command; 27] = [
     },
     Command {
         name: "uptime",
-        description: "tampilkan tick PIT sejak boot",
+        description: "tampilkan waktu hidup kernel",
         handler: command_uptime,
+    },
+    Command {
+        name: "buildinfo",
+        description: "tampilkan metadata build kernel",
+        handler: command_buildinfo,
+    },
+    Command {
+        name: "health",
+        description: "ringkasan kesehatan kernel",
+        handler: command_health,
+    },
+    Command {
+        name: "diag",
+        description: "diagnostik observability lengkap",
+        handler: command_diag,
+    },
+    Command {
+        name: "lastpanic",
+        description: "tampilkan panic terakhir di boot ini",
+        handler: command_lastpanic,
     },
     Command {
         name: "sysinfo",
@@ -630,12 +652,289 @@ fn command_echo(arguments: &[u8]) {
 }
 
 fn command_uptime(_arguments: &[u8]) {
-    serial::log_u64("shell", "uptime ticks", interrupts::ticks());
-    print("uptime ticks: ");
-    print_u64(interrupts::ticks());
-    print(" (~");
-    print_u64(interrupts::ticks() / PIT_HZ);
-    println("s)");
+    let ticks = interrupts::ticks();
+    let seconds = ticks / PIT_HZ;
+    let remainder_ticks = ticks % PIT_HZ;
+    let ready_tick = stats::snapshot().shell_ready_tick;
+
+    serial::log_u64("shell", "uptime seconds", seconds);
+    println("Uptime:");
+    print("  time      : ");
+    print_duration(seconds);
+    newline();
+    print_counter("seconds", seconds);
+    print_counter("ticks", ticks);
+    print_counter("tick hz", PIT_HZ);
+    print_counter("partial tick", remainder_ticks);
+    print_counter("shell ready", ready_tick);
+}
+
+fn command_buildinfo(_arguments: &[u8]) {
+    serial::log("build", "buildinfo requested");
+
+    println("Build info:");
+    println("  name      : Tobacco");
+    print("  package   : ");
+    println(env!("CARGO_PKG_NAME"));
+    print("  version   : ");
+    println(env!("CARGO_PKG_VERSION"));
+    println("  edition   : Rust 2021");
+    println("  target    : x86_64-unknown-none");
+    println("  boot      : GRUB Multiboot2 ISO");
+    println("  mode      : no_std / no_main");
+    print("  profile   : ");
+    if cfg!(debug_assertions) {
+        println("debug");
+    } else {
+        println("release");
+    }
+    print("  git sha   : ");
+    println(option_env!("GITHUB_SHA").unwrap_or("local"));
+    print("  workflow  : ");
+    println(option_env!("GITHUB_WORKFLOW").unwrap_or("local"));
+}
+
+fn command_health(_arguments: &[u8]) {
+    let issues = print_health_report();
+
+    if issues == 0 {
+        serial::log("health", "status ok");
+        println("status: OK");
+    } else {
+        serial::log_u64("health", "status issues", issues);
+        print("status: WARN (");
+        print_u64(issues);
+        println(" issue(s))");
+    }
+}
+
+fn command_diag(_arguments: &[u8]) {
+    let boot_info = multiboot::summary();
+    let frames = physmem::snapshot();
+    let paging_state = paging::snapshot();
+    let heap_state = heap::snapshot();
+    let log = klog::snapshot();
+    let counters = stats::snapshot();
+    let gdt_state = gdt::snapshot();
+    let panic = paniclog::snapshot();
+
+    serial::log("diag", "diagnostic report requested");
+    println("Tobacco diagnostics:");
+
+    print("  uptime       : ");
+    print_duration(interrupts::ticks() / PIT_HZ);
+    newline();
+    print("  build        : ");
+    print(env!("CARGO_PKG_VERSION"));
+    print(" / ");
+    println(option_env!("GITHUB_SHA").unwrap_or("local"));
+    print("  boot parsed  : ");
+    print_on_off(boot_info.parsed);
+    newline();
+    print_counter("boot tags", boot_info.tag_count as u64);
+    print_counter("usable bytes", boot_info.memory.usable_bytes);
+    print_counter("free frames", frames.free_frames);
+    print_counter("mapped pages", paging_state.mapped_pages);
+    print_counter("heap used", heap_state.used);
+    print_counter("heap remain", heap_state.remaining);
+    print_counter("log entries", log.count);
+    print_counter("log dropped", log.dropped);
+    print_counter("timer irq", counters.timer_irqs);
+    print_counter("keyboard irq", counters.keyboard_irqs);
+    print_counter("exceptions", counters.exceptions);
+    print_counter("shell errors", counters.shell_errors);
+    print_counter("vga scrolls", counters.vga_scrolls);
+    print_counter("serial bytes", counters.serial_bytes);
+    print("  gdt/tss      : ");
+    print_on_off(gdt_state.loaded);
+    newline();
+    print("  last panic   : ");
+    print_on_off(panic.present);
+    newline();
+
+    let issues = health_issue_count();
+    print_counter("health issues", issues);
+}
+
+fn command_lastpanic(_arguments: &[u8]) {
+    let panic = paniclog::snapshot();
+
+    println("Last panic:");
+    if !panic.present {
+        println("  none recorded in this boot");
+        return;
+    }
+
+    print("  tick      : ");
+    print_u64(panic.tick);
+    newline();
+    print("  kind      : ");
+    print_log_bytes(panic.kind());
+    newline();
+    print("  detail    : ");
+    print_log_bytes(panic.detail());
+    newline();
+    print("  vector    : ");
+    print_u64(panic.vector);
+    newline();
+    print("  error     : ");
+    print_hex_u64(panic.error_code);
+    newline();
+    print("  rip       : ");
+    print_hex_u64(panic.instruction_pointer);
+    newline();
+    print("  cr2       : ");
+    print_hex_u64(panic.fault_address);
+    newline();
+    print("  rflags    : ");
+    print_hex_u64(panic.cpu_flags);
+    newline();
+}
+
+fn print_health_report() -> u64 {
+    let boot_info = multiboot::summary();
+    let frames = physmem::snapshot();
+    let paging_state = paging::snapshot();
+    let heap_state = heap::snapshot();
+    let gdt_state = gdt::snapshot();
+    let log = klog::snapshot();
+    let counters = stats::snapshot();
+    let ticks = interrupts::ticks();
+    let panic = paniclog::snapshot();
+    let mut issues = 0u64;
+
+    println("Tobacco health:");
+    health_line(
+        "boot",
+        boot_info.valid_magic && boot_info.parsed && boot_info.tag_count > 0,
+        &mut issues,
+    );
+    health_line(
+        "memory map",
+        boot_info.memory.has_memory_map && boot_info.memory.usable_bytes > 0,
+        &mut issues,
+    );
+    health_line(
+        "frame allocator",
+        frames.initialized && frames.allocatable_frames > 0 && frames.free_frames > 0,
+        &mut issues,
+    );
+    health_line(
+        "paging/vmm",
+        paging_state.initialized
+            && paging_state.mapper_initialized
+            && paging_state.identity_mapped_bytes >= paging::BOOT_IDENTITY_MAP_BYTES,
+        &mut issues,
+    );
+    health_line(
+        "kernel heap",
+        heap_state.initialized && heap_state.remaining <= heap_state.size,
+        &mut issues,
+    );
+    health_line(
+        "guard pages",
+        !paging::translate(heap_state.guard_low).mapped
+            && !paging::translate(heap_state.guard_high).mapped,
+        &mut issues,
+    );
+    health_line(
+        "gdt/tss/ist",
+        gdt_state.loaded && gdt_state.double_fault_stack_bytes >= STACK_BYTES,
+        &mut issues,
+    );
+    health_line(
+        "kernel log",
+        log.initialized && log.count <= log.capacity,
+        &mut issues,
+    );
+    health_line(
+        "serial/vga",
+        counters.serial_bytes > 0 && counters.vga_cell_writes > 0,
+        &mut issues,
+    );
+    health_line("timer", ticks >= counters.shell_ready_tick, &mut issues);
+    health_line(
+        "keyboard queue",
+        keyboard::pending_events() < 256,
+        &mut issues,
+    );
+    health_line("command table", COMMANDS.len() >= 32, &mut issues);
+    health_line("last panic", !panic.present, &mut issues);
+
+    issues
+}
+
+fn health_issue_count() -> u64 {
+    let boot_info = multiboot::summary();
+    let frames = physmem::snapshot();
+    let paging_state = paging::snapshot();
+    let heap_state = heap::snapshot();
+    let gdt_state = gdt::snapshot();
+    let log = klog::snapshot();
+    let counters = stats::snapshot();
+    let ticks = interrupts::ticks();
+    let panic = paniclog::snapshot();
+    let mut issues = 0u64;
+
+    count_issue(
+        boot_info.valid_magic && boot_info.parsed && boot_info.tag_count > 0,
+        &mut issues,
+    );
+    count_issue(
+        boot_info.memory.has_memory_map && boot_info.memory.usable_bytes > 0,
+        &mut issues,
+    );
+    count_issue(
+        frames.initialized && frames.allocatable_frames > 0 && frames.free_frames > 0,
+        &mut issues,
+    );
+    count_issue(
+        paging_state.initialized
+            && paging_state.mapper_initialized
+            && paging_state.identity_mapped_bytes >= paging::BOOT_IDENTITY_MAP_BYTES,
+        &mut issues,
+    );
+    count_issue(
+        heap_state.initialized && heap_state.remaining <= heap_state.size,
+        &mut issues,
+    );
+    count_issue(
+        !paging::translate(heap_state.guard_low).mapped
+            && !paging::translate(heap_state.guard_high).mapped,
+        &mut issues,
+    );
+    count_issue(
+        gdt_state.loaded && gdt_state.double_fault_stack_bytes >= STACK_BYTES,
+        &mut issues,
+    );
+    count_issue(log.initialized && log.count <= log.capacity, &mut issues);
+    count_issue(
+        counters.serial_bytes > 0 && counters.vga_cell_writes > 0,
+        &mut issues,
+    );
+    count_issue(ticks >= counters.shell_ready_tick, &mut issues);
+    count_issue(keyboard::pending_events() < 256, &mut issues);
+    count_issue(COMMANDS.len() >= 32, &mut issues);
+    count_issue(!panic.present, &mut issues);
+
+    issues
+}
+
+fn health_line(label: &str, ok: bool, issues: &mut u64) {
+    print("  ");
+    if ok {
+        print("[OK]   ");
+    } else {
+        print("[WARN] ");
+        *issues = (*issues).saturating_add(1);
+    }
+    println(label);
+}
+
+fn count_issue(ok: bool, issues: &mut u64) {
+    if !ok {
+        *issues = (*issues).saturating_add(1);
+    }
 }
 
 fn command_sysinfo(_arguments: &[u8]) {
@@ -654,6 +953,7 @@ fn command_sysinfo(_arguments: &[u8]) {
     println("  exceptions: vector-specific panic diagnostics");
     println("  shell     : line editor, history, command table");
     println("  klog      : in-memory kernel ring buffer");
+    println("  observe   : health, diag, lastpanic, buildinfo");
     println("  selftest  : non-destructive kernel diagnostics");
     println("  stability : selftest + bounded stress command");
     println("  metrics   : perf, irq, boot, bench");
@@ -1347,7 +1647,7 @@ fn command_selftest(_arguments: &[u8]) {
     );
     selftest_check(
         "command table sane",
-        COMMANDS.len() >= 27,
+        COMMANDS.len() >= 32,
         &mut passed,
         &mut failed,
     );
@@ -1636,6 +1936,29 @@ fn print_u64(mut value: u64) {
         vga::write_byte(byte);
         serial::write_byte(byte);
     }
+}
+
+fn print_duration(seconds: u64) {
+    let days = seconds / 86_400;
+    let hours = (seconds / 3_600) % 24;
+    let minutes = (seconds / 60) % 60;
+    let secs = seconds % 60;
+
+    print_u64(days);
+    print("d ");
+    print_two_digits(hours);
+    print(":");
+    print_two_digits(minutes);
+    print(":");
+    print_two_digits(secs);
+}
+
+fn print_two_digits(value: u64) {
+    let value = value % 100;
+    if value < 10 {
+        print("0");
+    }
+    print_u64(value);
 }
 
 fn print_hex_u64(value: u64) {
