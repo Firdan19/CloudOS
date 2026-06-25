@@ -733,6 +733,7 @@ fn command_diag(_arguments: &[u8]) {
     let boot_info = multiboot::summary();
     let frames = physmem::snapshot();
     let paging_state = paging::snapshot();
+    let paging_audit = paging::permission_audit();
     let heap_state = heap::snapshot();
     let log = klog::snapshot();
     let counters = stats::snapshot();
@@ -758,6 +759,8 @@ fn command_diag(_arguments: &[u8]) {
     print_counter("usable bytes", boot_info.memory.usable_bytes);
     print_counter("free frames", frames.free_frames);
     print_counter("mapped pages", paging_state.mapped_pages);
+    print_counter("tracked pages", paging_state.tracked_mappings);
+    print_counter("permission faults", paging_audit.violations);
     print_counter("heap used", heap_state.used);
     print_counter("heap remain", heap_state.remaining);
     print_counter("log entries", log.count);
@@ -827,6 +830,7 @@ fn print_health_report() -> u64 {
     let boot_info = multiboot::summary();
     let frames = physmem::snapshot();
     let paging_state = paging::snapshot();
+    let paging_audit = paging::permission_audit();
     let heap_state = heap::snapshot();
     let gdt_state = gdt::snapshot();
     let log = klog::snapshot();
@@ -861,8 +865,25 @@ fn print_health_report() -> u64 {
         &mut issues,
     );
     health_line(
+        "page ownership",
+        paging_state.tracked_mappings > 0
+            && paging_state.tracked_mappings <= paging_state.tracking_capacity
+            && paging_state.tracking_overflows == 0,
+        &mut issues,
+    );
+    health_line(
+        "permission audit",
+        paging_audit.violations == 0
+            && paging_audit.guard_pages_intact
+            && paging_audit.tracking_consistent,
+        &mut issues,
+    );
+    health_line(
         "kernel heap",
-        heap_state.initialized && heap_state.remaining <= heap_state.size,
+        heap_state.initialized
+            && heap_state.remaining <= heap_state.size
+            && heap_state.metadata_ok
+            && heap_state.sentinel_ok,
         &mut issues,
     );
     health_line(
@@ -919,6 +940,7 @@ fn health_issue_count() -> u64 {
     let boot_info = multiboot::summary();
     let frames = physmem::snapshot();
     let paging_state = paging::snapshot();
+    let paging_audit = paging::permission_audit();
     let heap_state = heap::snapshot();
     let gdt_state = gdt::snapshot();
     let log = klog::snapshot();
@@ -948,7 +970,22 @@ fn health_issue_count() -> u64 {
         &mut issues,
     );
     count_issue(
-        heap_state.initialized && heap_state.remaining <= heap_state.size,
+        paging_state.tracked_mappings > 0
+            && paging_state.tracked_mappings <= paging_state.tracking_capacity
+            && paging_state.tracking_overflows == 0,
+        &mut issues,
+    );
+    count_issue(
+        paging_audit.violations == 0
+            && paging_audit.guard_pages_intact
+            && paging_audit.tracking_consistent,
+        &mut issues,
+    );
+    count_issue(
+        heap_state.initialized
+            && heap_state.remaining <= heap_state.size
+            && heap_state.metadata_ok
+            && heap_state.sentinel_ok,
         &mut issues,
     );
     count_issue(
@@ -1025,8 +1062,8 @@ fn command_sysinfo(_arguments: &[u8]) {
     println("  keyboard  : PS/2 IRQ1 event layer");
     println("  boot info : Multiboot2 parser + memory map");
     println("  memory    : physical frame allocator");
-    println("  paging    : boot identity map inspector");
-    println("  vmm       : high-half mapper, guard pages, heap");
+    println("  paging    : identity map inspector + tracked map/unmap");
+    println("  vmm       : ownership, permission audit, guard pages, heap");
     println("  gdt/tss   : double fault IST stack");
     println("  user mode : Ring 3 probe pages + int 0x80 syscall gate");
     println("  exceptions: vector-specific panic diagnostics");
@@ -1508,6 +1545,7 @@ fn command_gdt(_arguments: &[u8]) {
 
 fn command_paging(_arguments: &[u8]) {
     let snapshot = paging::snapshot();
+    let audit = paging::permission_audit();
 
     println("Paging:");
     print("  initialized       : ");
@@ -1542,6 +1580,19 @@ fn command_paging(_arguments: &[u8]) {
     print_counter("unmapped pages", snapshot.unmapped_pages);
     print_counter("page table frames", snapshot.page_table_frames);
     print_counter("guard pages", snapshot.guard_pages);
+    print_counter("tracked pages", snapshot.tracked_mappings);
+    print_counter("tracking capacity", snapshot.tracking_capacity);
+    print_counter("tracking overflows", snapshot.tracking_overflows);
+    print_counter("tracking misses", snapshot.tracking_misses);
+    print_counter("kernel owned", snapshot.kernel_owned_pages);
+    print_counter("heap owned", snapshot.heap_owned_pages);
+    print_counter("user owned", snapshot.user_owned_pages);
+    print_counter("test owned", snapshot.test_owned_pages);
+    print("  permission audit  : ");
+    print_on_off(audit.violations == 0 && audit.tracking_consistent && audit.guard_pages_intact);
+    newline();
+    print_counter("audit checked", audit.checked_pages);
+    print_counter("audit violations", audit.violations);
     print("  managed start     : ");
     print_hex_u64(paging::KERNEL_VIRTUAL_BASE);
     newline();
@@ -1572,6 +1623,15 @@ fn command_heap(_arguments: &[u8]) {
     print_counter("mapped pages", snapshot.mapped_pages);
     print_counter("allocations", snapshot.allocations);
     print_counter("failed alloc", snapshot.failed_allocations);
+    print_counter("high watermark", snapshot.high_watermark);
+    print_counter("corruption checks", snapshot.corruption_checks);
+    print_counter("corruption fail", snapshot.corruption_failures);
+    print("  metadata          : ");
+    print_on_off(snapshot.metadata_ok);
+    newline();
+    print("  sentinel          : ");
+    print_on_off(snapshot.sentinel_ok);
+    newline();
     print("  guard low         : ");
     print_hex_u64(snapshot.guard_low);
     print(" ");
@@ -1681,6 +1741,7 @@ fn command_selftest(_arguments: &[u8]) {
     let memory = boot_info.memory;
     let frames = physmem::snapshot();
     let paging_state = paging::snapshot();
+    let paging_audit = paging::permission_audit();
     let vga_translation = paging::translate(VGA_BUFFER_ADDRESS);
     let high_translation = paging::translate(0xffff_8000_0000_0000);
     let gdt = gdt::snapshot();
@@ -1764,16 +1825,50 @@ fn command_selftest(_arguments: &[u8]) {
         &mut failed,
     );
     selftest_check(
+        "page ownership tracking",
+        paging_state.tracked_mappings > 0
+            && paging_state.tracked_mappings <= paging_state.tracking_capacity
+            && paging_state.tracking_overflows == 0
+            && paging_state.heap_owned_pages == heap::HEAP_PAGES
+            && paging_state.user_owned_pages >= 2,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "user kernel permission audit",
+        paging_audit.violations == 0
+            && paging_audit.guard_pages_intact
+            && paging_audit.tracking_consistent
+            && paging_audit.user_pages >= 2
+            && paging_audit.heap_pages == heap::HEAP_PAGES,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "guard page policy",
+        paging::guard_page_test(),
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
         "heap initialized",
         heap_snapshot.initialized
             && heap_snapshot.mapped_pages == heap::HEAP_PAGES
             && heap_snapshot.remaining <= heap_snapshot.size
+            && heap_snapshot.metadata_ok
+            && heap_snapshot.sentinel_ok
             && !paging::translate(heap_snapshot.guard_low).mapped
             && !paging::translate(heap_snapshot.guard_high).mapped,
         &mut passed,
         &mut failed,
     );
     selftest_check("heap probe", heap::probe(), &mut passed, &mut failed);
+    selftest_check(
+        "allocator corruption guard",
+        heap::corruption_check(),
+        &mut passed,
+        &mut failed,
+    );
     selftest_check(
         "gdt tss ist ready",
         gdt.loaded
@@ -1866,6 +1961,7 @@ fn command_stress(arguments: &[u8]) {
     let ticks_before = interrupts::ticks();
     let log_before = klog::snapshot();
     let serial_before = stats::snapshot().serial_bytes;
+    let paging_before = paging::snapshot();
     let mut checksum = 0x544f_4241_4343_4f53u64;
     let mut paging_failures = 0u64;
 
@@ -1888,12 +1984,28 @@ fn command_stress(arguments: &[u8]) {
     let ticks_after = interrupts::ticks();
     let log_after = klog::snapshot();
     let serial_after = stats::snapshot().serial_bytes;
+    let paging_after = paging::snapshot();
+    let paging_audit = paging::permission_audit();
     let mut passed = 0u64;
     let mut failed = 0u64;
 
     selftest_check(
         "paging repeated translation",
         paging_failures == 0,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "memory tracking stable",
+        paging_after.tracking_overflows == paging_before.tracking_overflows
+            && paging_after.tracking_misses == paging_before.tracking_misses
+            && paging_audit.violations == 0,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "allocator corruption guard",
+        heap::corruption_check(),
         &mut passed,
         &mut failed,
     );

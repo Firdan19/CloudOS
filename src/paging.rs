@@ -31,6 +31,7 @@ const DEFAULT_PAGE_FLAGS: u64 = ENTRY_PRESENT | ENTRY_WRITABLE;
 const USER_PAGE_FLAGS: u64 = DEFAULT_PAGE_FLAGS | ENTRY_USER;
 const ENTRY_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 const HUGE_ENTRY_ADDR_MASK: u64 = 0x000f_ffff_ffe0_0000;
+pub const MAX_TRACKED_MAPPINGS: usize = 128;
 
 unsafe extern "C" {
     static boot_p4_table: u64;
@@ -56,6 +57,15 @@ pub struct Snapshot {
     pub unmapped_pages: u64,
     pub page_table_frames: u64,
     pub guard_pages: u64,
+    pub tracked_mappings: u64,
+    pub tracking_capacity: u64,
+    pub tracking_overflows: u64,
+    pub tracking_misses: u64,
+    pub kernel_owned_pages: u64,
+    pub heap_owned_pages: u64,
+    pub user_owned_pages: u64,
+    pub test_owned_pages: u64,
+    pub permission_violations: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -88,12 +98,84 @@ pub enum UnmapError {
     PageTableNotReachable,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PageOwner {
+    Kernel,
+    Heap,
+    User,
+    Test,
+}
+
+impl PageOwner {
+    fn default_flags(self) -> u64 {
+        match self {
+            PageOwner::User => USER_PAGE_FLAGS,
+            PageOwner::Kernel | PageOwner::Heap | PageOwner::Test => DEFAULT_PAGE_FLAGS,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct MappingInfo {
+    pub virt: u64,
+    pub phys: u64,
+    pub owner: PageOwner,
+    pub user_accessible: bool,
+    pub writable: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct PermissionAudit {
+    pub checked_pages: u64,
+    pub violations: u64,
+    pub kernel_pages: u64,
+    pub heap_pages: u64,
+    pub user_pages: u64,
+    pub test_pages: u64,
+    pub guard_pages_intact: bool,
+    pub tracking_consistent: bool,
+}
+
+#[derive(Clone, Copy)]
+struct MappingRecord {
+    virt: u64,
+    phys: u64,
+    flags: u64,
+    owner: PageOwner,
+    active: bool,
+}
+
+impl MappingRecord {
+    const fn empty() -> Self {
+        Self {
+            virt: 0,
+            phys: 0,
+            flags: 0,
+            owner: PageOwner::Kernel,
+            active: false,
+        }
+    }
+
+    fn info(&self) -> MappingInfo {
+        MappingInfo {
+            virt: self.virt,
+            phys: self.phys,
+            owner: self.owner,
+            user_accessible: self.flags & ENTRY_USER != 0,
+            writable: self.flags & ENTRY_WRITABLE != 0,
+        }
+    }
+}
+
 struct MapperState {
     initialized: bool,
     mapped_pages: u64,
     unmapped_pages: u64,
     page_table_frames: u64,
     guard_pages: u64,
+    records: [MappingRecord; MAX_TRACKED_MAPPINGS],
+    tracking_overflows: u64,
+    tracking_misses: u64,
 }
 
 impl MapperState {
@@ -104,7 +186,92 @@ impl MapperState {
             unmapped_pages: 0,
             page_table_frames: 0,
             guard_pages: 0,
+            records: [MappingRecord::empty(); MAX_TRACKED_MAPPINGS],
+            tracking_overflows: 0,
+            tracking_misses: 0,
         }
+    }
+
+    fn record_mapping(&mut self, virt: u64, phys: u64, flags: u64, owner: PageOwner) {
+        for record in self.records.iter_mut() {
+            if record.active && record.virt == virt {
+                record.phys = phys;
+                record.flags = flags;
+                record.owner = owner;
+                return;
+            }
+        }
+
+        for record in self.records.iter_mut() {
+            if !record.active {
+                *record = MappingRecord {
+                    virt,
+                    phys,
+                    flags,
+                    owner,
+                    active: true,
+                };
+                return;
+            }
+        }
+
+        self.tracking_overflows = self.tracking_overflows.saturating_add(1);
+    }
+
+    fn forget_mapping(&mut self, virt: u64) -> Option<MappingRecord> {
+        for record in self.records.iter_mut() {
+            if record.active && record.virt == virt {
+                let removed = *record;
+                *record = MappingRecord::empty();
+                return Some(removed);
+            }
+        }
+
+        self.tracking_misses = self.tracking_misses.saturating_add(1);
+        None
+    }
+
+    fn mapping_info(&self, virt: u64) -> Option<MappingInfo> {
+        for record in self.records.iter() {
+            if record.active && record.virt == align_down(virt, PAGE_SIZE_4K) {
+                return Some(record.info());
+            }
+        }
+
+        None
+    }
+
+    fn active_mapping_count(&self) -> u64 {
+        let mut count = 0;
+        for record in self.records.iter() {
+            if record.active {
+                count += 1;
+            }
+        }
+
+        count
+    }
+
+    fn owner_counts(&self) -> (u64, u64, u64, u64) {
+        let mut kernel = 0;
+        let mut heap = 0;
+        let mut user = 0;
+        let mut test = 0;
+
+        for record in self.records.iter() {
+            if !record.active {
+                continue;
+            }
+
+            match record.owner {
+                PageOwner::Kernel => kernel += 1,
+                PageOwner::Heap => heap += 1,
+                PageOwner::User => user += 1,
+                PageOwner::Test => test += 1,
+            }
+        }
+
+        (kernel, heap, user, test)
     }
 }
 
@@ -134,6 +301,7 @@ pub fn init() -> Snapshot {
     serial::log_hex_u64("paging", "p2 table", snapshot.p2_addr);
     serial::log_u64("paging", "huge pages", snapshot.huge_pages);
     serial::log("paging", "virtual mapper ready");
+    serial::log("paging", "page ownership tracking ready");
 
     snapshot
 }
@@ -148,6 +316,9 @@ pub fn snapshot() -> Snapshot {
     let p2_present_entries = count_present_entries(p2);
     let huge_pages = count_huge_entries(p2);
     let state = mapper_state();
+    let (kernel_owned_pages, heap_owned_pages, user_owned_pages, test_owned_pages) =
+        state.owner_counts();
+    let audit = permission_audit_inner(state);
 
     Snapshot {
         initialized: PAGING_INITIALIZED.load(Ordering::Acquire),
@@ -166,6 +337,15 @@ pub fn snapshot() -> Snapshot {
         unmapped_pages: state.unmapped_pages,
         page_table_frames: state.page_table_frames,
         guard_pages: state.guard_pages,
+        tracked_mappings: state.active_mapping_count(),
+        tracking_capacity: MAX_TRACKED_MAPPINGS as u64,
+        tracking_overflows: state.tracking_overflows,
+        tracking_misses: state.tracking_misses,
+        kernel_owned_pages,
+        heap_owned_pages,
+        user_owned_pages,
+        test_owned_pages,
+        permission_violations: audit.violations,
     }
 }
 
@@ -236,12 +416,16 @@ pub fn translate(virt: u64) -> TranslateResult {
 }
 
 pub fn map_new_page(virt: u64) -> Result<u64, MapError> {
+    map_new_page_owned(virt, PageOwner::Kernel)
+}
+
+pub fn map_new_page_owned(virt: u64, owner: PageOwner) -> Result<u64, MapError> {
     cpu_interrupts::without_interrupts(|| {
         if !is_page_aligned(virt) {
             return Err(MapError::VirtualUnaligned);
         }
 
-        if !in_managed_virtual_range(virt) {
+        if !in_mappable_virtual_range(virt, owner.default_flags()) {
             return Err(MapError::OutsideManagedRange);
         }
 
@@ -251,22 +435,26 @@ pub fn map_new_page(virt: u64) -> Result<u64, MapError> {
 
         let phys = physmem::allocate_frame().ok_or(MapError::OutOfFrames)?;
         if !identity_reachable(phys) {
+            let _ = physmem::free_frame(phys);
             return Err(MapError::PhysicalNotIdentityMapped);
         }
 
         zero_frame(phys);
-        map_page_inner(virt, phys)?;
+        if let Err(error) = map_page_inner_with_owner(virt, phys, owner) {
+            let _ = physmem::free_frame(phys);
+            return Err(error);
+        }
 
         Ok(phys)
     })
 }
 
 pub fn map_page(virt: u64, phys: u64) -> Result<(), MapError> {
-    cpu_interrupts::without_interrupts(|| map_page_inner(virt, phys))
+    cpu_interrupts::without_interrupts(|| map_page_inner_with_owner(virt, phys, PageOwner::Kernel))
 }
 
 pub fn map_user_page(virt: u64, phys: u64) -> Result<(), MapError> {
-    cpu_interrupts::without_interrupts(|| map_page_inner_with_flags(virt, phys, USER_PAGE_FLAGS))
+    cpu_interrupts::without_interrupts(|| map_page_inner_with_owner(virt, phys, PageOwner::User))
 }
 
 pub fn unmap_page(virt: u64) -> Result<u64, UnmapError> {
@@ -278,12 +466,20 @@ pub fn probe_map_unmap(virt: u64) -> bool {
         return false;
     }
 
-    let Ok(phys) = map_new_page(virt) else {
+    let Ok(phys) = map_new_page_owned(virt, PageOwner::Test) else {
         return false;
     };
 
     let mapped = translate(virt);
-    if !mapped.mapped || mapped.phys != phys || mapped.page_size != PAGE_SIZE_4K {
+    let owner = mapping_info(virt);
+    if !mapped.mapped
+        || mapped.phys != phys
+        || mapped.page_size != PAGE_SIZE_4K
+        || owner.map(|info| info.owner) != Some(PageOwner::Test)
+    {
+        if let Ok(unmapped_phys) = unmap_page(virt) {
+            let _ = physmem::free_frame(unmapped_phys);
+        }
         return false;
     }
 
@@ -291,7 +487,31 @@ pub fn probe_map_unmap(virt: u64) -> bool {
         return false;
     };
 
-    unmapped_phys == phys && physmem::free_frame(unmapped_phys) && !translate(virt).mapped
+    unmapped_phys == phys
+        && physmem::free_frame(unmapped_phys)
+        && !translate(virt).mapped
+        && mapping_info(virt).is_none()
+}
+
+pub fn mapping_info(virt: u64) -> Option<MappingInfo> {
+    mapper_state().mapping_info(virt)
+}
+
+pub fn permission_audit() -> PermissionAudit {
+    cpu_interrupts::without_interrupts(|| permission_audit_inner(mapper_state()))
+}
+
+pub fn guard_page_test() -> bool {
+    !translate(KERNEL_HEAP_GUARD_LOW).mapped
+        && !translate(KERNEL_HEAP_GUARD_HIGH).mapped
+        && matches!(
+            map_new_page_owned(KERNEL_HEAP_GUARD_LOW, PageOwner::Test),
+            Err(MapError::OutsideManagedRange)
+        )
+        && matches!(
+            map_new_page_owned(KERNEL_HEAP_GUARD_HIGH, PageOwner::Test),
+            Err(MapError::OutsideManagedRange)
+        )
 }
 
 pub fn fault_policy(address: u64, _error_code: u64) -> &'static str {
@@ -397,11 +617,16 @@ fn count_huge_entries(table: &[u64; PAGE_TABLE_ENTRIES]) -> u64 {
     count
 }
 
-fn map_page_inner(virt: u64, phys: u64) -> Result<(), MapError> {
-    map_page_inner_with_flags(virt, phys, DEFAULT_PAGE_FLAGS)
+fn map_page_inner_with_owner(virt: u64, phys: u64, owner: PageOwner) -> Result<(), MapError> {
+    map_page_inner_with_flags(virt, phys, owner.default_flags(), owner)
 }
 
-fn map_page_inner_with_flags(virt: u64, phys: u64, flags: u64) -> Result<(), MapError> {
+fn map_page_inner_with_flags(
+    virt: u64,
+    phys: u64,
+    flags: u64,
+    owner: PageOwner,
+) -> Result<(), MapError> {
     if !is_page_aligned(virt) {
         return Err(MapError::VirtualUnaligned);
     }
@@ -440,6 +665,7 @@ fn map_page_inner_with_flags(virt: u64, phys: u64, flags: u64) -> Result<(), Map
     p1[p1_index] = phys | flags;
     let state = mapper_state_mut();
     state.mapped_pages = state.mapped_pages.saturating_add(1);
+    state.record_mapping(virt, phys, flags, owner);
     invlpg(virt);
 
     Ok(())
@@ -450,7 +676,7 @@ fn unmap_page_inner(virt: u64) -> Result<u64, UnmapError> {
         return Err(UnmapError::VirtualUnaligned);
     }
 
-    if !in_managed_virtual_range(virt) {
+    if !in_managed_virtual_range(virt) && !in_user_virtual_range(virt) {
         return Err(UnmapError::OutsideManagedRange);
     }
 
@@ -487,9 +713,69 @@ fn unmap_page_inner(virt: u64) -> Result<u64, UnmapError> {
     p1[p1_index] = 0;
     let state = mapper_state_mut();
     state.unmapped_pages = state.unmapped_pages.saturating_add(1);
+    state.forget_mapping(virt);
     invlpg(virt);
 
     Ok(entry_addr(entry))
+}
+
+fn permission_audit_inner(state: &MapperState) -> PermissionAudit {
+    let mut audit = PermissionAudit {
+        checked_pages: 0,
+        violations: 0,
+        kernel_pages: 0,
+        heap_pages: 0,
+        user_pages: 0,
+        test_pages: 0,
+        guard_pages_intact: !translate(KERNEL_HEAP_GUARD_LOW).mapped
+            && !translate(KERNEL_HEAP_GUARD_HIGH).mapped,
+        tracking_consistent: true,
+    };
+
+    for record in state.records.iter() {
+        if !record.active {
+            continue;
+        }
+
+        audit.checked_pages = audit.checked_pages.saturating_add(1);
+
+        match record.owner {
+            PageOwner::Kernel => audit.kernel_pages = audit.kernel_pages.saturating_add(1),
+            PageOwner::Heap => audit.heap_pages = audit.heap_pages.saturating_add(1),
+            PageOwner::User => audit.user_pages = audit.user_pages.saturating_add(1),
+            PageOwner::Test => audit.test_pages = audit.test_pages.saturating_add(1),
+        }
+
+        let translated = translate(record.virt);
+        let mut ok = translated.mapped
+            && translated.phys == record.phys
+            && translated.page_size == PAGE_SIZE_4K
+            && translated.user_accessible == (record.flags & ENTRY_USER != 0);
+
+        match record.owner {
+            PageOwner::User => {
+                ok &= in_user_virtual_range(record.virt) && translated.user_accessible;
+            }
+            PageOwner::Kernel | PageOwner::Heap | PageOwner::Test => {
+                ok &= in_managed_virtual_range(record.virt) && !translated.user_accessible;
+            }
+        }
+
+        if !ok {
+            audit.violations = audit.violations.saturating_add(1);
+        }
+    }
+
+    if audit.checked_pages != state.active_mapping_count() || state.tracking_overflows != 0 {
+        audit.tracking_consistent = false;
+        audit.violations = audit.violations.saturating_add(1);
+    }
+
+    if !audit.guard_pages_intact {
+        audit.violations = audit.violations.saturating_add(1);
+    }
+
+    audit
 }
 
 fn ensure_next_table(
@@ -507,6 +793,7 @@ fn ensure_next_table(
 
     let frame = physmem::allocate_frame().ok_or(MapError::OutOfFrames)?;
     if !identity_reachable(frame) {
+        let _ = physmem::free_frame(frame);
         return Err(MapError::PhysicalNotIdentityMapped);
     }
 
@@ -556,7 +843,7 @@ fn in_mappable_virtual_range(virt: u64, flags: u64) -> bool {
     if flags & ENTRY_USER != 0 {
         in_user_virtual_range(virt)
     } else {
-        in_managed_virtual_range(virt)
+        in_managed_virtual_range(virt) && !is_guard_page(virt)
     }
 }
 
@@ -568,8 +855,16 @@ fn is_page_aligned(value: u64) -> bool {
     value & (PAGE_SIZE_4K - 1) == 0
 }
 
+const fn align_down(value: u64, alignment: u64) -> u64 {
+    value & !(alignment - 1)
+}
+
 fn in_page(address: u64, page_start: u64) -> bool {
     address >= page_start && address < page_start.saturating_add(PAGE_SIZE_4K)
+}
+
+fn is_guard_page(virt: u64) -> bool {
+    in_page(virt, KERNEL_HEAP_GUARD_LOW) || in_page(virt, KERNEL_HEAP_GUARD_HIGH)
 }
 
 fn entry_present(entry: u64) -> bool {

@@ -114,6 +114,7 @@ fn run_selftest_checks() -> bool {
     let memory = boot_info.memory;
     let frames = physmem::snapshot();
     let paging_state = paging::snapshot();
+    let paging_audit = paging::permission_audit();
     let vga_translation = paging::translate(VGA_BUFFER_ADDRESS);
     let high_translation = paging::translate(0xffff_8000_0000_0000);
     let gdt = gdt::snapshot();
@@ -167,14 +168,37 @@ fn run_selftest_checks() -> bool {
         paging::probe_map_unmap(paging::KERNEL_VM_TEST_PAGE),
     );
     ok &= check(
+        "selftest page ownership tracking",
+        paging_state.tracked_mappings > 0
+            && paging_state.tracked_mappings <= paging_state.tracking_capacity
+            && paging_state.tracking_overflows == 0
+            && paging_state.heap_owned_pages == heap::HEAP_PAGES
+            && paging_state.user_owned_pages >= 2,
+    );
+    ok &= check(
+        "selftest user kernel permission audit",
+        paging_audit.violations == 0
+            && paging_audit.guard_pages_intact
+            && paging_audit.tracking_consistent
+            && paging_audit.user_pages >= 2
+            && paging_audit.heap_pages == heap::HEAP_PAGES,
+    );
+    ok &= check("selftest guard page policy", paging::guard_page_test());
+    ok &= check(
         "selftest heap ready",
         heap_snapshot.initialized
             && heap_snapshot.mapped_pages == heap::HEAP_PAGES
             && heap_snapshot.remaining <= heap_snapshot.size
+            && heap_snapshot.metadata_ok
+            && heap_snapshot.sentinel_ok
             && !paging::translate(heap_snapshot.guard_low).mapped
             && !paging::translate(heap_snapshot.guard_high).mapped,
     );
     ok &= check("selftest heap probe", heap::probe());
+    ok &= check(
+        "selftest allocator corruption guard",
+        heap::corruption_check(),
+    );
     ok &= check(
         "selftest gdt tss ist ready",
         gdt.loaded
@@ -249,6 +273,7 @@ fn run_stability_stress() -> bool {
     let ticks_before = interrupts::ticks();
     let log_before = klog::snapshot();
     let serial_before = stats::snapshot().serial_bytes;
+    let paging_before = paging::snapshot();
     let mut checksum = 0x544f_4241_4343_4f43u64;
     let mut paging_ok = true;
 
@@ -269,9 +294,21 @@ fn run_stability_stress() -> bool {
     let ticks_after = interrupts::ticks();
     let log_after = klog::snapshot();
     let serial_after = stats::snapshot().serial_bytes;
+    let paging_after = paging::snapshot();
+    let paging_audit = paging::permission_audit();
 
     let mut ok = true;
     ok &= check("stress paging translation", paging_ok);
+    ok &= check(
+        "stress memory tracking stable",
+        paging_after.tracking_overflows == paging_before.tracking_overflows
+            && paging_after.tracking_misses == paging_before.tracking_misses
+            && paging_audit.violations == 0,
+    );
+    ok &= check(
+        "stress allocator corruption guard",
+        heap::corruption_check(),
+    );
     ok &= check(
         "stress log bounded",
         log_after.initialized
