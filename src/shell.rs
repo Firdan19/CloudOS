@@ -1,8 +1,8 @@
 use crate::keyboard::{self, KeyEvent};
-use crate::user;
 use crate::{
     gdt, heap, interrupts, klog, multiboot, paging, paniclog, physmem, serial, stats, vga,
 };
+use crate::{process, user};
 use x86_64::instructions::interrupts as cpu_interrupts;
 
 const INPUT_BUFFER_SIZE: usize = 512;
@@ -19,7 +19,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 36] = [
+const COMMANDS: [Command; 38] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -136,8 +136,18 @@ const COMMANDS: [Command; 36] = [
         handler: command_user,
     },
     Command {
+        name: "process",
+        description: "status task dan process model",
+        handler: command_process,
+    },
+    Command {
         name: "usertest",
-        description: "jalankan probe Ring 3 + syscall",
+        description: "jalankan user probe sebagai task",
+        handler: command_usertest,
+    },
+    Command {
+        name: "tasktest",
+        description: "alias untuk usertest",
         handler: command_usertest,
     },
     Command {
@@ -744,6 +754,7 @@ fn command_diag(_arguments: &[u8]) {
     let counters = stats::snapshot();
     let gdt_state = gdt::snapshot();
     let panic = paniclog::snapshot();
+    let process_state = process::snapshot();
     let user_state = user::snapshot();
     let interrupt_abi = interrupts::abi_snapshot();
 
@@ -783,6 +794,8 @@ fn command_diag(_arguments: &[u8]) {
     print_on_off(interrupt_abi_is_healthy(interrupt_abi));
     newline();
     print_counter("syscall vector", interrupt_abi.syscall_vector);
+    print_counter("tasks spawned", process_state.spawned_tasks);
+    print_counter("tasks exited", process_state.exited_total);
     print("  user mode    : ");
     print_on_off(user_state.initialized && user_state.syscall_gate_ready);
     newline();
@@ -842,6 +855,7 @@ fn print_health_report() -> u64 {
     let counters = stats::snapshot();
     let ticks = interrupts::ticks();
     let panic = paniclog::snapshot();
+    let process_state = process::snapshot();
     let user_state = user::snapshot();
     let interrupt_abi = interrupts::abi_snapshot();
     let mut issues = 0u64;
@@ -921,6 +935,11 @@ fn print_health_report() -> u64 {
         &mut issues,
     );
     health_line(
+        "process model",
+        process_state.initialized && process_state.running_tasks == 0 && process::selftest(),
+        &mut issues,
+    );
+    health_line(
         "kernel log",
         log.initialized && log.count <= log.capacity,
         &mut issues,
@@ -936,7 +955,7 @@ fn print_health_report() -> u64 {
         keyboard::pending_events() < 256,
         &mut issues,
     );
-    health_line("command table", COMMANDS.len() >= 35, &mut issues);
+    health_line("command table", COMMANDS.len() >= 38, &mut issues);
     health_line("last panic", !panic.present, &mut issues);
 
     issues
@@ -953,6 +972,7 @@ fn health_issue_count() -> u64 {
     let counters = stats::snapshot();
     let ticks = interrupts::ticks();
     let panic = paniclog::snapshot();
+    let process_state = process::snapshot();
     let user_state = user::snapshot();
     let interrupt_abi = interrupts::abi_snapshot();
     let mut issues = 0u64;
@@ -1016,6 +1036,10 @@ fn health_issue_count() -> u64 {
             && user_state.syscall_gate_ready,
         &mut issues,
     );
+    count_issue(
+        process_state.initialized && process_state.running_tasks == 0 && process::selftest(),
+        &mut issues,
+    );
     count_issue(log.initialized && log.count <= log.capacity, &mut issues);
     count_issue(
         counters.serial_bytes > 0 && counters.vga_cell_writes > 0,
@@ -1023,7 +1047,7 @@ fn health_issue_count() -> u64 {
     );
     count_issue(ticks >= counters.shell_ready_tick, &mut issues);
     count_issue(keyboard::pending_events() < 256, &mut issues);
-    count_issue(COMMANDS.len() >= 35, &mut issues);
+    count_issue(COMMANDS.len() >= 38, &mut issues);
     count_issue(!panic.present, &mut issues);
 
     issues
@@ -1437,6 +1461,7 @@ fn command_boot(_arguments: &[u8]) {
 
 fn command_user(_arguments: &[u8]) {
     let snapshot = user::snapshot();
+    let process_state = process::snapshot();
     let code = paging::translate(snapshot.code_virtual);
     let stack = paging::translate(paging::USER_PROBE_STACK_PAGE);
 
@@ -1472,14 +1497,26 @@ fn command_user(_arguments: &[u8]) {
     print_counter("syscalls", snapshot.syscall_count);
     print_counter("last exit", snapshot.last_exit_code);
     print_counter("last uptime", snapshot.last_uptime_return);
+    print_counter("tasks spawned", process_state.spawned_tasks);
+    print_counter("tasks exited", process_state.exited_total);
+    print_counter("last task", process_state.last_task_id);
 }
 
 fn command_usertest(_arguments: &[u8]) {
-    let result = user::run_probe();
+    let result = process::run_user_probe_task();
 
-    println("User mode probe:");
+    println("User process probe:");
     print("  ran              : ");
     print_on_off(result.ran);
+    newline();
+    print_counter("task id", result.task_id);
+    print("  task state       : ");
+    println(process::state_name(result.state));
+    print("  entry point      : ");
+    print_hex_u64(result.entry_point);
+    newline();
+    print("  stack top        : ");
+    print_hex_u64(result.stack_top);
     newline();
     print_counter("exit code", result.exit_code);
     print_counter("syscalls before", result.syscalls_before);
@@ -1491,6 +1528,45 @@ fn command_usertest(_arguments: &[u8]) {
     } else {
         stats::inc_shell_error();
         println("FAIL");
+    }
+}
+
+fn command_process(_arguments: &[u8]) {
+    let snapshot = process::snapshot();
+
+    println("Process model:");
+    print("  initialized      : ");
+    print_on_off(snapshot.initialized);
+    newline();
+    print_counter("capacity", snapshot.task_capacity);
+    print_counter("slots used", snapshot.task_slots_used);
+    print_counter("ready", snapshot.ready_tasks);
+    print_counter("running", snapshot.running_tasks);
+    print_counter("exited", snapshot.exited_tasks);
+    print_counter("next task id", snapshot.next_task_id);
+    print_counter("spawned total", snapshot.spawned_tasks);
+    print_counter("exited total", snapshot.exited_total);
+    print_counter("failed spawns", snapshot.failed_spawns);
+    print_counter("last task", snapshot.last_task_id);
+    print_counter("last exit", snapshot.last_exit_code);
+
+    println("Tasks:");
+    for index in 0..process::MAX_TASKS {
+        if let Some(task) = process::task(index) {
+            print("  #");
+            print_u64(task.id);
+            print(" ");
+            print(process::state_name(task.state));
+            print(" entry=");
+            print_hex_u64(task.entry_point);
+            print(" stack=");
+            print_hex_u64(task.stack_top);
+            print(" exit=");
+            print_u64(task.exit_code);
+            print(" syscalls=");
+            print_u64(task.syscalls_after.saturating_sub(task.syscalls_before));
+            newline();
+        }
     }
 }
 
@@ -1785,6 +1861,7 @@ fn command_selftest(_arguments: &[u8]) {
     let log = klog::snapshot();
     let counters = stats::snapshot();
     let ticks = interrupts::ticks();
+    let process_state = process::snapshot();
     let user_state = user::snapshot();
     let interrupt_abi = interrupts::abi_snapshot();
 
@@ -1941,6 +2018,18 @@ fn command_selftest(_arguments: &[u8]) {
         &mut failed,
     );
     selftest_check(
+        "process table ready",
+        process_state.initialized && process_state.task_capacity == process::MAX_TASKS as u64,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "process model selftest",
+        process::selftest(),
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
         "kernel log ring ready",
         log.initialized && log.capacity == klog::ENTRY_COUNT as u64 && log.count > 0,
         &mut passed,
@@ -1972,7 +2061,7 @@ fn command_selftest(_arguments: &[u8]) {
     );
     selftest_check(
         "command table sane",
-        COMMANDS.len() >= 35,
+        COMMANDS.len() >= 38,
         &mut passed,
         &mut failed,
     );

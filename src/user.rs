@@ -12,7 +12,7 @@ const USER_CODE_BYTES: [u8; 59] = [
 const SYSCALL_LOG: u64 = 1;
 const SYSCALL_UPTIME: u64 = 2;
 const SYSCALL_EXIT: u64 = 3;
-const PROBE_EXIT_CODE: u64 = 42;
+pub const PROBE_EXIT_CODE: u64 = 42;
 
 #[repr(C, align(4096))]
 struct Page {
@@ -146,7 +146,7 @@ pub fn snapshot() -> Snapshot {
     }
 }
 
-pub fn run_probe() -> ProbeResult {
+pub fn run_entry(entry_point: u64, stack_top: u64) -> ProbeResult {
     let before = USER_SYSCALLS.load(Ordering::Acquire);
 
     if !USER_READY.load(Ordering::Acquire) || !interrupts::syscall_gate_ready() {
@@ -165,8 +165,8 @@ pub fn run_probe() -> ProbeResult {
 
     let exit_code = unsafe {
         user_enter(
-            paging::USER_PROBE_CODE_PAGE,
-            paging::USER_PROBE_STACK_TOP,
+            entry_point,
+            stack_top,
             gdt::USER_DATA_SELECTOR as u64,
             gdt::USER_CODE_SELECTOR as u64,
         )
@@ -192,6 +192,22 @@ pub fn run_probe() -> ProbeResult {
         syscalls_before: before,
         syscalls_after: after,
     }
+}
+
+pub fn run_probe() -> ProbeResult {
+    run_entry(probe_entry_point(), probe_stack_top())
+}
+
+pub fn probe_entry_point() -> u64 {
+    paging::USER_PROBE_CODE_PAGE
+}
+
+pub fn probe_stack_top() -> u64 {
+    paging::USER_PROBE_STACK_TOP
+}
+
+pub fn probe_expected_exit_code() -> u64 {
+    PROBE_EXIT_CODE
 }
 
 #[no_mangle]

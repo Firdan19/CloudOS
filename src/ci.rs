@@ -1,6 +1,6 @@
 use crate::{
-    gdt, heap, interrupts, keyboard, klog, multiboot, paging, physmem, serial, shell, stats, user,
-    vga,
+    gdt, heap, interrupts, keyboard, klog, multiboot, paging, physmem, process, serial, shell,
+    stats, user, vga,
 };
 use x86_64::instructions::hlt;
 
@@ -103,7 +103,9 @@ fn run_command_table_checks() {
     check("command heaptest", shell::command_exists(b"heaptest"));
     check("command vmtest", shell::command_exists(b"vmtest"));
     check("command user", shell::command_exists(b"user"));
+    check("command process", shell::command_exists(b"process"));
     check("command usertest", shell::command_exists(b"usertest"));
+    check("command tasktest", shell::command_exists(b"tasktest"));
     check("command syscall", shell::command_exists(b"syscall"));
     check("command consoletest", shell::command_exists(b"consoletest"));
     check("command mem", shell::command_exists(b"mem"));
@@ -123,6 +125,7 @@ fn run_selftest_checks() -> bool {
     let log = klog::snapshot();
     let counters = stats::snapshot();
     let ticks = interrupts::ticks();
+    let process_state = process::snapshot();
     let user_state = user::snapshot();
     let interrupt_abi = interrupts::abi_snapshot();
 
@@ -234,6 +237,11 @@ fn run_selftest_checks() -> bool {
             && user_state.syscall_gate_ready,
     );
     ok &= check(
+        "selftest process table ready",
+        process_state.initialized && process_state.task_capacity == process::MAX_TASKS as u64,
+    );
+    ok &= check("selftest process model", process::selftest());
+    ok &= check(
         "selftest kernel log ready",
         log.initialized && log.capacity == klog::ENTRY_COUNT as u64 && log.count > 0,
     );
@@ -247,27 +255,44 @@ fn run_selftest_checks() -> bool {
         "selftest keyboard queue sane",
         keyboard::pending_events() < 256,
     );
-    ok &= check("selftest command table sane", shell::command_count() >= 35);
+    ok &= check("selftest command table sane", shell::command_count() >= 38);
 
     ok
 }
 
 fn run_user_mode_checks() -> bool {
     let before = user::snapshot();
-    let result = user::run_probe();
+    let process_before = process::snapshot();
+    let result = process::run_user_probe_task();
     let after = user::snapshot();
+    let process_after = process::snapshot();
     let mut ok = true;
 
     ok &= check("user mode initialized", before.initialized);
     ok &= check("user syscall gate ready", before.syscall_gate_ready);
+    ok &= check("user process spawned", result.task_id > 0);
+    ok &= check(
+        "user process exited",
+        result.state == process::TaskState::Exited,
+    );
     ok &= check("user probe ran", result.ran);
-    ok &= check("user probe exit code", result.exit_code == 42);
+    ok &= check(
+        "user probe exit code",
+        result.exit_code == user::probe_expected_exit_code(),
+    );
     ok &= check(
         "user probe syscalls",
         result.syscalls_after >= result.syscalls_before + 3,
     );
     ok &= check("user probe passed", result.passed);
     ok &= check("user pass counter", after.pass_count > before.pass_count);
+    ok &= check(
+        "user process accounting",
+        process_after.spawned_tasks > process_before.spawned_tasks
+            && process_after.exited_total > process_before.exited_total
+            && process_after.last_task_id == result.task_id
+            && process_after.last_exit_code == result.exit_code,
+    );
 
     ok
 }
