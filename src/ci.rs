@@ -356,7 +356,7 @@ fn stress_paging_round(cycle: u64, checksum: &mut u64) -> bool {
         rolling_address,
         paging::BOOT_IDENTITY_MAP_BYTES - 1,
     ];
-    let unmapped_addresses = [paging::BOOT_IDENTITY_MAP_BYTES, 0xffff_8000_0000_0000];
+    let unmapped_addresses = [paging::USER_SPACE_END, 0xffff_8000_0000_0000];
 
     for address in mapped_addresses.iter().copied() {
         let result = paging::translate(address);
