@@ -19,7 +19,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 35] = [
+const COMMANDS: [Command; 36] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -159,6 +159,11 @@ const COMMANDS: [Command; 35] = [
         name: "heap",
         description: "status kernel heap",
         handler: command_heap,
+    },
+    Command {
+        name: "heaptest",
+        description: "uji allocator heap",
+        handler: command_heaptest,
     },
     Command {
         name: "virt",
@@ -883,7 +888,8 @@ fn print_health_report() -> u64 {
         heap_state.initialized
             && heap_state.remaining <= heap_state.size
             && heap_state.metadata_ok
-            && heap_state.sentinel_ok,
+            && heap_state.sentinel_ok
+            && heap_state.allocation_canaries_ok,
         &mut issues,
     );
     health_line(
@@ -985,7 +991,8 @@ fn health_issue_count() -> u64 {
         heap_state.initialized
             && heap_state.remaining <= heap_state.size
             && heap_state.metadata_ok
-            && heap_state.sentinel_ok,
+            && heap_state.sentinel_ok
+            && heap_state.allocation_canaries_ok,
         &mut issues,
     );
     count_issue(
@@ -1622,15 +1629,31 @@ fn command_heap(_arguments: &[u8]) {
     newline();
     print_counter("mapped pages", snapshot.mapped_pages);
     print_counter("allocations", snapshot.allocations);
+    print_counter("frees", snapshot.frees);
     print_counter("failed alloc", snapshot.failed_allocations);
+    print_counter("failed frees", snapshot.failed_frees);
+    print_counter("double frees", snapshot.double_frees);
+    print_counter("invalid frees", snapshot.invalid_frees);
+    print_counter("coalesces", snapshot.coalesces);
+    print_counter("active alloc", snapshot.active_allocations);
+    print_counter("free blocks", snapshot.free_blocks);
+    print_counter("metadata blocks", snapshot.metadata_blocks);
+    print_counter("metadata cap", snapshot.metadata_capacity);
+    print_counter("allocated bytes", snapshot.allocated_bytes);
+    print_counter("free bytes", snapshot.free_bytes);
+    print_counter("largest free", snapshot.largest_free_block);
     print_counter("high watermark", snapshot.high_watermark);
     print_counter("corruption checks", snapshot.corruption_checks);
     print_counter("corruption fail", snapshot.corruption_failures);
+    print_counter("corruption detect", snapshot.corruption_detections);
     print("  metadata          : ");
     print_on_off(snapshot.metadata_ok);
     newline();
     print("  sentinel          : ");
     print_on_off(snapshot.sentinel_ok);
+    newline();
+    print("  alloc canaries    : ");
+    print_on_off(snapshot.allocation_canaries_ok);
     newline();
     print("  guard low         : ");
     print_hex_u64(snapshot.guard_low);
@@ -1642,6 +1665,19 @@ fn command_heap(_arguments: &[u8]) {
     print(" ");
     print_on_off(!paging::translate(snapshot.guard_high).mapped);
     newline();
+}
+
+fn command_heaptest(_arguments: &[u8]) {
+    println("Kernel heap selftest:");
+
+    if heap::selftest() {
+        serial::log("heap", "heaptest passed");
+        println("  status            : PASS");
+    } else {
+        serial::log("heap", "heaptest failed");
+        stats::inc_shell_error();
+        println("  status            : FAIL");
+    }
 }
 
 fn command_virt(arguments: &[u8]) {
@@ -1857,12 +1893,19 @@ fn command_selftest(_arguments: &[u8]) {
             && heap_snapshot.remaining <= heap_snapshot.size
             && heap_snapshot.metadata_ok
             && heap_snapshot.sentinel_ok
+            && heap_snapshot.allocation_canaries_ok
             && !paging::translate(heap_snapshot.guard_low).mapped
             && !paging::translate(heap_snapshot.guard_high).mapped,
         &mut passed,
         &mut failed,
     );
     selftest_check("heap probe", heap::probe(), &mut passed, &mut failed);
+    selftest_check(
+        "heap allocator free coalesce",
+        heap::selftest(),
+        &mut passed,
+        &mut failed,
+    );
     selftest_check(
         "allocator corruption guard",
         heap::corruption_check(),
@@ -2006,6 +2049,12 @@ fn command_stress(arguments: &[u8]) {
     selftest_check(
         "allocator corruption guard",
         heap::corruption_check(),
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "heap allocator reuse",
+        heap::stress(),
         &mut passed,
         &mut failed,
     );

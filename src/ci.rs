@@ -100,6 +100,7 @@ fn run_command_table_checks() {
     check("command stress", shell::command_exists(b"stress"));
     check("command paging", shell::command_exists(b"paging"));
     check("command heap", shell::command_exists(b"heap"));
+    check("command heaptest", shell::command_exists(b"heaptest"));
     check("command vmtest", shell::command_exists(b"vmtest"));
     check("command user", shell::command_exists(b"user"));
     check("command usertest", shell::command_exists(b"usertest"));
@@ -191,10 +192,12 @@ fn run_selftest_checks() -> bool {
             && heap_snapshot.remaining <= heap_snapshot.size
             && heap_snapshot.metadata_ok
             && heap_snapshot.sentinel_ok
+            && heap_snapshot.allocation_canaries_ok
             && !paging::translate(heap_snapshot.guard_low).mapped
             && !paging::translate(heap_snapshot.guard_high).mapped,
     );
     ok &= check("selftest heap probe", heap::probe());
+    ok &= check("selftest heap allocator free coalesce", heap::selftest());
     ok &= check(
         "selftest allocator corruption guard",
         heap::corruption_check(),
@@ -309,6 +312,7 @@ fn run_stability_stress() -> bool {
         "stress allocator corruption guard",
         heap::corruption_check(),
     );
+    ok &= check("stress heap allocator reuse", heap::stress());
     ok &= check(
         "stress log bounded",
         log_after.initialized
