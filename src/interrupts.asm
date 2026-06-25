@@ -195,7 +195,11 @@ ci_trigger_double_fault_stub:
 
 user_enter:
     push rbp
-    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
     mov [rel user_return_rsp], rsp
     lea rax, [rel .return_from_user]
     mov [rel user_return_rip], rax
@@ -224,6 +228,11 @@ user_enter:
     mov fs, ax
     mov gs, ax
     mov rax, [rel user_exit_code]
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     pop rbp
     ret
 
