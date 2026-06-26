@@ -20,7 +20,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 46] = [
+const COMMANDS: [Command; 47] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -175,6 +175,11 @@ const COMMANDS: [Command; 46] = [
         name: "tasktest",
         description: "alias untuk usertest",
         handler: command_usertest,
+    },
+    Command {
+        name: "faulttest",
+        description: "uji isolasi page fault user",
+        handler: command_faulttest,
     },
     Command {
         name: "syscall",
@@ -901,6 +906,7 @@ fn command_faults(_arguments: &[u8]) {
     println("Faults:");
     print_counter("exceptions", counters.exceptions);
     print_counter("default irq", counters.default_irqs);
+    print_counter("user faults", user::snapshot().fault_count);
     print_counter("page track miss", paging_state.tracking_misses);
     print_counter("page track overflow", paging_state.tracking_overflows);
     print_counter("permission faults", paging_state.permission_violations);
@@ -1059,7 +1065,7 @@ fn print_health_report() -> u64 {
         keyboard::pending_events() < 256,
         &mut issues,
     );
-    health_line("command table", COMMANDS.len() >= 46, &mut issues);
+    health_line("command table", COMMANDS.len() >= 47, &mut issues);
     health_line("last panic", !panic.present, &mut issues);
 
     issues
@@ -1161,7 +1167,7 @@ fn health_issue_count() -> u64 {
     );
     count_issue(ticks >= counters.shell_ready_tick, &mut issues);
     count_issue(keyboard::pending_events() < 256, &mut issues);
-    count_issue(COMMANDS.len() >= 46, &mut issues);
+    count_issue(COMMANDS.len() >= 47, &mut issues);
     count_issue(!panic.present, &mut issues);
 
     issues
@@ -1641,6 +1647,12 @@ fn command_user(_arguments: &[u8]) {
     print_counter("runs", snapshot.run_count);
     print_counter("passes", snapshot.pass_count);
     print_counter("syscalls", snapshot.syscall_count);
+    print_counter("faults", snapshot.fault_count);
+    print_counter("last fault", snapshot.last_fault_vector);
+    print("  fault address     : ");
+    print_hex_u64(snapshot.last_fault_address);
+    newline();
+    print_counter("fault exit", snapshot.last_fault_exit_code);
     print_counter("last exit", snapshot.last_exit_code);
     print_counter("last uptime", snapshot.last_uptime_return);
     print_counter("tasks spawned", process_state.spawned_tasks);
@@ -1667,6 +1679,39 @@ fn command_usertest(_arguments: &[u8]) {
     print_counter("exit code", result.exit_code);
     print_counter("syscalls before", result.syscalls_before);
     print_counter("syscalls after", result.syscalls_after);
+    print("  status           : ");
+
+    if result.passed {
+        println("PASS");
+    } else {
+        stats::inc_shell_error();
+        println("FAIL");
+    }
+}
+
+fn command_faulttest(_arguments: &[u8]) {
+    let result = process::run_user_fault_task();
+    let user_state = user::snapshot();
+
+    println("User fault isolation test:");
+    print("  ran              : ");
+    print_on_off(result.ran);
+    newline();
+    print_counter("task id", result.task_id);
+    print("  task state       : ");
+    println(process::state_name(result.state));
+    print("  entry point      : ");
+    print_hex_u64(result.entry_point);
+    newline();
+    print("  fault address    : ");
+    print_hex_u64(user_state.last_fault_address);
+    newline();
+    print_counter("fault vector", user_state.last_fault_vector);
+    print_counter("exit code", result.exit_code);
+    print_counter("fault count", user_state.fault_count);
+    print("  kernel survived  : ");
+    print_on_off(result.passed && scheduler::snapshot().current_task == 0);
+    newline();
     print("  status           : ");
 
     if result.passed {
@@ -2356,7 +2401,7 @@ fn command_selftest(_arguments: &[u8]) {
     );
     selftest_check(
         "command table sane",
-        COMMANDS.len() >= 46,
+        COMMANDS.len() >= 47,
         &mut passed,
         &mut failed,
     );

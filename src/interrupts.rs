@@ -1,5 +1,5 @@
 use crate::keyboard::KeyEvent;
-use crate::{gdt, keyboard, paging, paniclog, scheduler, serial, stats, vga};
+use crate::{gdt, keyboard, paging, paniclog, scheduler, serial, stats, user, vga};
 use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use x86_64::instructions::interrupts as cpu_interrupts;
@@ -355,6 +355,10 @@ pub extern "C" fn exception_dispatch_handler(context: *const ExceptionContext) -
     let fault_address = if context.vector == 14 { read_cr2() } else { 0 };
     let name = exception_name(context.vector);
 
+    if exception_from_user(context.code_segment) {
+        handle_user_exception(name, context, fault_address);
+    }
+
     paniclog::record_exception(
         name,
         context.vector,
@@ -378,7 +382,7 @@ pub extern "C" fn exception_dispatch_handler(context: *const ExceptionContext) -
             "panic",
             paging::fault_policy(fault_address, context.error_code),
         );
-        log_page_fault_bits(context.error_code);
+        log_page_fault_bits("panic", context.error_code);
     }
 
     vga::show_exception_screen(
@@ -394,6 +398,32 @@ pub extern "C" fn exception_dispatch_handler(context: *const ExceptionContext) -
     loop {
         x86_64::instructions::hlt();
     }
+}
+
+fn handle_user_exception(name: &'static str, context: ExceptionContext, fault_address: u64) -> ! {
+    let exit_code = user::fault_exit_code(context.vector);
+
+    user::record_fault(context.vector, fault_address, exit_code);
+    serial::log("fault", "user exception isolated");
+    serial::log("fault", name);
+    serial::log_u64("fault", "exception vector", context.vector);
+    serial::log_hex_u64("fault", "error code", context.error_code);
+    serial::log_hex_u64("fault", "rip", context.instruction_pointer);
+    serial::log_hex_u64("fault", "cs", context.code_segment);
+    serial::log_hex_u64("fault", "rflags", context.cpu_flags);
+
+    if context.vector == 14 {
+        serial::log_hex_u64("fault", "cr2", fault_address);
+        serial::log("fault", "ring3 page fault killed user task");
+        serial::log(
+            "fault",
+            paging::fault_policy(fault_address, context.error_code),
+        );
+        log_page_fault_bits("fault", context.error_code);
+    }
+
+    serial::log_u64("fault", "task exit code", exit_code);
+    unsafe { user::exit_to_kernel(exit_code) }
 }
 
 fn exception_name(vector: u64) -> &'static str {
@@ -427,12 +457,16 @@ fn exception_name(vector: u64) -> &'static str {
     }
 }
 
-fn log_page_fault_bits(error_code: u64) {
-    serial::log_bool("panic", "page present", error_code & (1 << 0) != 0);
-    serial::log_bool("panic", "page write", error_code & (1 << 1) != 0);
-    serial::log_bool("panic", "page user", error_code & (1 << 2) != 0);
-    serial::log_bool("panic", "page reserved", error_code & (1 << 3) != 0);
-    serial::log_bool("panic", "page instruction", error_code & (1 << 4) != 0);
+fn exception_from_user(code_segment: u64) -> bool {
+    code_segment & 0x3 == 0x3
+}
+
+fn log_page_fault_bits(tag: &str, error_code: u64) {
+    serial::log_bool(tag, "page present", error_code & (1 << 0) != 0);
+    serial::log_bool(tag, "page write", error_code & (1 << 1) != 0);
+    serial::log_bool(tag, "page user", error_code & (1 << 2) != 0);
+    serial::log_bool(tag, "page reserved", error_code & (1 << 3) != 0);
+    serial::log_bool(tag, "page instruction", error_code & (1 << 4) != 0);
 }
 
 fn gate_present(options: u16) -> bool {

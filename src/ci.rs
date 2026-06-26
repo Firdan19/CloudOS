@@ -110,6 +110,7 @@ fn run_command_table_checks() {
     check("command sched", shell::command_exists(b"sched"));
     check("command usertest", shell::command_exists(b"usertest"));
     check("command tasktest", shell::command_exists(b"tasktest"));
+    check("command faulttest", shell::command_exists(b"faulttest"));
     check("command syscall", shell::command_exists(b"syscall"));
     check("command syscalls", shell::command_exists(b"syscalls"));
     check("command idt", shell::command_exists(b"idt"));
@@ -277,7 +278,7 @@ fn run_selftest_checks() -> bool {
         "selftest keyboard queue sane",
         keyboard::pending_events() < 256,
     );
-    ok &= check("selftest command table sane", shell::command_count() >= 46);
+    ok &= check("selftest command table sane", shell::command_count() >= 47);
 
     ok
 }
@@ -328,6 +329,31 @@ fn run_user_mode_checks() -> bool {
         syscall_after.dispatches >= result.syscalls_after
             && syscall_after.last_number == syscall::SYSCALL_EXIT
             && syscall_after.last_return == syscall::RET_OK,
+    );
+    let faults_before = user::snapshot().fault_count;
+    let fault_result = process::run_user_fault_task();
+    let fault_after = user::snapshot();
+    let process_fault_after = process::snapshot();
+    ok &= check("user fault process spawned", fault_result.task_id > 0);
+    ok &= check("user fault probe ran", fault_result.ran);
+    ok &= check(
+        "user fault task exited",
+        fault_result.state == process::TaskState::Exited,
+    );
+    ok &= check(
+        "user fault exit code",
+        fault_result.exit_code == user::fault_exit_code(14),
+    );
+    ok &= check(
+        "user fault isolated",
+        fault_result.passed && process_fault_after.running_tasks == 0,
+    );
+    ok &= check(
+        "user fault accounting",
+        fault_after.fault_count > faults_before
+            && fault_after.last_fault_vector == 14
+            && fault_after.last_fault_address == user::fault_address()
+            && fault_after.last_fault_exit_code == user::fault_exit_code(14),
     );
 
     ok

@@ -144,6 +144,14 @@ impl ProcessTable {
     }
 
     fn spawn_user_probe(&mut self) -> Option<Task> {
+        self.spawn_user_program(user::probe_entry_point())
+    }
+
+    fn spawn_user_fault_probe(&mut self) -> Option<Task> {
+        self.spawn_user_program(user::fault_entry_point())
+    }
+
+    fn spawn_user_program(&mut self, entry_point: u64) -> Option<Task> {
         if !self.initialized {
             self.init();
         }
@@ -160,7 +168,7 @@ impl ProcessTable {
         let task = Task {
             id,
             state: TaskState::Ready,
-            entry_point: user::probe_entry_point(),
+            entry_point,
             stack_top: user::probe_stack_top(),
             exit_code: 0,
             syscalls_before: 0,
@@ -328,6 +336,66 @@ pub fn run_user_probe_task() -> TaskRunResult {
         .map(|finished| finished.state)
         .unwrap_or(TaskState::Exited);
     let passed = user_result.passed && state == TaskState::Exited;
+
+    TaskRunResult {
+        ran: user_result.ran,
+        passed,
+        task_id: task.id,
+        state,
+        entry_point: task.entry_point,
+        stack_top: task.stack_top,
+        exit_code: user_result.exit_code,
+        syscalls_before: user_result.syscalls_before,
+        syscalls_after: user_result.syscalls_after,
+    }
+}
+
+pub fn run_user_fault_task() -> TaskRunResult {
+    let Some(task) = cpu_interrupts::without_interrupts(|| table_mut().spawn_user_fault_probe())
+    else {
+        return TaskRunResult {
+            ran: false,
+            passed: false,
+            task_id: 0,
+            state: TaskState::Empty,
+            entry_point: user::fault_entry_point(),
+            stack_top: user::probe_stack_top(),
+            exit_code: 0,
+            syscalls_before: user::snapshot().syscall_count,
+            syscalls_after: user::snapshot().syscall_count,
+        };
+    };
+
+    let syscalls_before = user::snapshot().syscall_count;
+    let running =
+        cpu_interrupts::without_interrupts(|| table_mut().mark_running(task.id, syscalls_before));
+    if !running {
+        return TaskRunResult {
+            ran: false,
+            passed: false,
+            task_id: task.id,
+            state: TaskState::Ready,
+            entry_point: task.entry_point,
+            stack_top: task.stack_top,
+            exit_code: 0,
+            syscalls_before,
+            syscalls_after: syscalls_before,
+        };
+    }
+
+    let user_result = user::run_entry(task.entry_point, task.stack_top);
+    let exited_task = cpu_interrupts::without_interrupts(|| {
+        table_mut().mark_exited(task.id, user_result.exit_code, user_result.syscalls_after)
+    });
+
+    let state = exited_task
+        .map(|finished| finished.state)
+        .unwrap_or(TaskState::Exited);
+    let expected_exit = user::fault_exit_code(14);
+    let passed = user_result.ran
+        && state == TaskState::Exited
+        && user_result.exit_code == expected_exit
+        && user::snapshot().last_fault_vector == 14;
 
     TaskRunResult {
         ran: user_result.ran,

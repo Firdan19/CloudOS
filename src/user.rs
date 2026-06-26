@@ -10,6 +10,9 @@ const USER_CODE_BYTES: [u8; 71] = [
     0x00, 0x00, 0xcd, 0x80, 0xf4, 0xeb, 0xfd,
 ];
 
+const USER_FAULT_CODE_OFFSET: u64 = 128;
+const USER_FAULT_ADDRESS: u64 = paging::USER_SPACE_BASE + 0x3000;
+pub const USER_FAULT_EXIT_BASE: u64 = 0x1000;
 pub const PROBE_EXIT_CODE: u64 = 42;
 
 #[repr(C, align(4096))]
@@ -31,6 +34,10 @@ pub struct Snapshot {
     pub run_count: u64,
     pub pass_count: u64,
     pub syscall_count: u64,
+    pub fault_count: u64,
+    pub last_fault_vector: u64,
+    pub last_fault_address: u64,
+    pub last_fault_exit_code: u64,
     pub last_exit_code: u64,
     pub last_uptime_return: u64,
 }
@@ -74,6 +81,10 @@ static USER_STACK_MAPPED: AtomicBool = AtomicBool::new(false);
 static USER_RUNS: AtomicU64 = AtomicU64::new(0);
 static USER_PASSES: AtomicU64 = AtomicU64::new(0);
 static USER_SYSCALLS: AtomicU64 = AtomicU64::new(0);
+static USER_FAULTS: AtomicU64 = AtomicU64::new(0);
+static LAST_FAULT_VECTOR: AtomicU64 = AtomicU64::new(0);
+static LAST_FAULT_ADDRESS: AtomicU64 = AtomicU64::new(0);
+static LAST_FAULT_EXIT_CODE: AtomicU64 = AtomicU64::new(0);
 static LAST_EXIT_CODE: AtomicU64 = AtomicU64::new(0);
 static LAST_UPTIME_RETURN: AtomicU64 = AtomicU64::new(0);
 
@@ -139,6 +150,10 @@ pub fn snapshot() -> Snapshot {
         run_count: USER_RUNS.load(Ordering::Acquire),
         pass_count: USER_PASSES.load(Ordering::Acquire),
         syscall_count: USER_SYSCALLS.load(Ordering::Acquire),
+        fault_count: USER_FAULTS.load(Ordering::Acquire),
+        last_fault_vector: LAST_FAULT_VECTOR.load(Ordering::Acquire),
+        last_fault_address: LAST_FAULT_ADDRESS.load(Ordering::Acquire),
+        last_fault_exit_code: LAST_FAULT_EXIT_CODE.load(Ordering::Acquire),
         last_exit_code: LAST_EXIT_CODE.load(Ordering::Acquire),
         last_uptime_return: LAST_UPTIME_RETURN.load(Ordering::Acquire),
     }
@@ -200,6 +215,14 @@ pub fn probe_entry_point() -> u64 {
     paging::USER_PROBE_CODE_PAGE
 }
 
+pub fn fault_entry_point() -> u64 {
+    paging::USER_PROBE_CODE_PAGE + USER_FAULT_CODE_OFFSET
+}
+
+pub fn fault_address() -> u64 {
+    USER_FAULT_ADDRESS
+}
+
 pub fn probe_stack_top() -> u64 {
     paging::USER_PROBE_STACK_TOP
 }
@@ -208,8 +231,19 @@ pub fn probe_expected_exit_code() -> u64 {
     PROBE_EXIT_CODE
 }
 
+pub fn fault_exit_code(vector: u64) -> u64 {
+    USER_FAULT_EXIT_BASE.saturating_add(vector)
+}
+
 pub fn record_syscall() {
     USER_SYSCALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_fault(vector: u64, fault_address: u64, exit_code: u64) {
+    USER_FAULTS.fetch_add(1, Ordering::Relaxed);
+    LAST_FAULT_VECTOR.store(vector, Ordering::Release);
+    LAST_FAULT_ADDRESS.store(fault_address, Ordering::Release);
+    LAST_FAULT_EXIT_CODE.store(exit_code, Ordering::Release);
 }
 
 pub fn record_uptime_return(ticks: u64) {
@@ -234,6 +268,26 @@ fn write_probe_program() {
         for (index, byte) in USER_CODE_BYTES.iter().copied().enumerate() {
             page.add(index).write_volatile(byte);
         }
+
+        write_fault_program(page.add(USER_FAULT_CODE_OFFSET as usize));
+    }
+}
+
+unsafe fn write_fault_program(destination: *mut u8) {
+    unsafe {
+        destination.add(0).write_volatile(0x48);
+        destination.add(1).write_volatile(0xb8);
+
+        for (index, byte) in USER_FAULT_ADDRESS.to_le_bytes().iter().copied().enumerate() {
+            destination.add(2 + index).write_volatile(byte);
+        }
+
+        destination.add(10).write_volatile(0x48);
+        destination.add(11).write_volatile(0x8b);
+        destination.add(12).write_volatile(0x00);
+        destination.add(13).write_volatile(0xf4);
+        destination.add(14).write_volatile(0xeb);
+        destination.add(15).write_volatile(0xfd);
     }
 }
 
