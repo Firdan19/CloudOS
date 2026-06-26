@@ -94,6 +94,7 @@ fn run_command_table_checks() {
     check("command status", shell::command_exists(b"status"));
     check("command diag", shell::command_exists(b"diag"));
     check("command lastpanic", shell::command_exists(b"lastpanic"));
+    check("command faults", shell::command_exists(b"faults"));
     check("command buildinfo", shell::command_exists(b"buildinfo"));
     check("command uptime", shell::command_exists(b"uptime"));
     check("command selftest", shell::command_exists(b"selftest"));
@@ -101,13 +102,19 @@ fn run_command_table_checks() {
     check("command paging", shell::command_exists(b"paging"));
     check("command heap", shell::command_exists(b"heap"));
     check("command heaptest", shell::command_exists(b"heaptest"));
+    check("command heapcheck", shell::command_exists(b"heapcheck"));
     check("command vmtest", shell::command_exists(b"vmtest"));
     check("command user", shell::command_exists(b"user"));
     check("command process", shell::command_exists(b"process"));
+    check("command tasks", shell::command_exists(b"tasks"));
     check("command sched", shell::command_exists(b"sched"));
     check("command usertest", shell::command_exists(b"usertest"));
     check("command tasktest", shell::command_exists(b"tasktest"));
     check("command syscall", shell::command_exists(b"syscall"));
+    check("command syscalls", shell::command_exists(b"syscalls"));
+    check("command idt", shell::command_exists(b"idt"));
+    check("command gdt", shell::command_exists(b"gdt"));
+    check("command mmap", shell::command_exists(b"mmap"));
     check("command consoletest", shell::command_exists(b"consoletest"));
     check("command mem", shell::command_exists(b"mem"));
     check("command log", shell::command_exists(b"log"));
@@ -270,7 +277,7 @@ fn run_selftest_checks() -> bool {
         "selftest keyboard queue sane",
         keyboard::pending_events() < 256,
     );
-    ok &= check("selftest command table sane", shell::command_count() >= 40);
+    ok &= check("selftest command table sane", shell::command_count() >= 46);
 
     ok
 }

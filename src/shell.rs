@@ -20,7 +20,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 40] = [
+const COMMANDS: [Command; 46] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -77,6 +77,11 @@ const COMMANDS: [Command; 40] = [
         handler: command_lastpanic,
     },
     Command {
+        name: "faults",
+        description: "status fault dan exception kernel",
+        handler: command_faults,
+    },
+    Command {
         name: "sysinfo",
         description: "ringkasan subsistem kernel",
         handler: command_sysinfo,
@@ -89,6 +94,11 @@ const COMMANDS: [Command; 40] = [
     Command {
         name: "memmap",
         description: "daftar region memory map",
+        handler: command_memmap,
+    },
+    Command {
+        name: "mmap",
+        description: "alias untuk memmap",
         handler: command_memmap,
     },
     Command {
@@ -142,6 +152,11 @@ const COMMANDS: [Command; 40] = [
         handler: command_process,
     },
     Command {
+        name: "tasks",
+        description: "daftar task kernel",
+        handler: command_tasks,
+    },
+    Command {
         name: "sched",
         description: "status scheduler minimal",
         handler: command_scheduler,
@@ -167,9 +182,19 @@ const COMMANDS: [Command; 40] = [
         handler: command_syscall,
     },
     Command {
+        name: "syscalls",
+        description: "alias untuk syscall",
+        handler: command_syscall,
+    },
+    Command {
         name: "gdt",
         description: "status GDT, TSS, dan IST",
         handler: command_gdt,
+    },
+    Command {
+        name: "idt",
+        description: "status IDT dan interrupt gates",
+        handler: command_idt,
     },
     Command {
         name: "paging",
@@ -185,6 +210,11 @@ const COMMANDS: [Command; 40] = [
         name: "heaptest",
         description: "uji allocator heap",
         handler: command_heaptest,
+    },
+    Command {
+        name: "heapcheck",
+        description: "cek integritas heap",
+        handler: command_heapcheck,
     },
     Command {
         name: "virt",
@@ -862,6 +892,50 @@ fn command_lastpanic(_arguments: &[u8]) {
     newline();
 }
 
+fn command_faults(_arguments: &[u8]) {
+    let panic = paniclog::snapshot();
+    let counters = stats::snapshot();
+    let paging_state = paging::snapshot();
+
+    serial::log("faults", "fault status requested");
+    println("Faults:");
+    print_counter("exceptions", counters.exceptions);
+    print_counter("default irq", counters.default_irqs);
+    print_counter("page track miss", paging_state.tracking_misses);
+    print_counter("page track overflow", paging_state.tracking_overflows);
+    print_counter("permission faults", paging_state.permission_violations);
+    print("  last panic       : ");
+    print_on_off(panic.present);
+    newline();
+
+    if !panic.present {
+        println("  last detail      : none recorded");
+        return;
+    }
+
+    print("  kind             : ");
+    print_log_bytes(panic.kind());
+    newline();
+    print("  detail           : ");
+    print_log_bytes(panic.detail());
+    newline();
+    print("  vector           : ");
+    print_u64(panic.vector);
+    newline();
+    print("  error            : ");
+    print_hex_u64(panic.error_code);
+    newline();
+    print("  rip              : ");
+    print_hex_u64(panic.instruction_pointer);
+    newline();
+    print("  cr2              : ");
+    print_hex_u64(panic.fault_address);
+    newline();
+    print("  rflags           : ");
+    print_hex_u64(panic.cpu_flags);
+    newline();
+}
+
 fn print_health_report() -> u64 {
     let boot_info = multiboot::summary();
     let frames = physmem::snapshot();
@@ -985,7 +1059,7 @@ fn print_health_report() -> u64 {
         keyboard::pending_events() < 256,
         &mut issues,
     );
-    health_line("command table", COMMANDS.len() >= 40, &mut issues);
+    health_line("command table", COMMANDS.len() >= 46, &mut issues);
     health_line("last panic", !panic.present, &mut issues);
 
     issues
@@ -1087,7 +1161,7 @@ fn health_issue_count() -> u64 {
     );
     count_issue(ticks >= counters.shell_ready_tick, &mut issues);
     count_issue(keyboard::pending_events() < 256, &mut issues);
-    count_issue(COMMANDS.len() >= 40, &mut issues);
+    count_issue(COMMANDS.len() >= 46, &mut issues);
     count_issue(!panic.present, &mut issues);
 
     issues
@@ -1434,6 +1508,38 @@ fn command_irq(_arguments: &[u8]) {
     print_counter("current ticks", interrupts::ticks());
 }
 
+fn command_idt(_arguments: &[u8]) {
+    let abi = interrupts::abi_snapshot();
+    let counters = stats::snapshot();
+
+    serial::log("idt", "idt status requested");
+    println("IDT/Interrupt ABI:");
+    print_counter("idt entry bytes", abi.idt_entry_bytes);
+    print_counter("exception ctx", abi.exception_context_bytes);
+    print("  timer gate       : ");
+    print_on_off(abi.timer_gate_present);
+    newline();
+    print("  keyboard gate    : ");
+    print_on_off(abi.keyboard_gate_present);
+    newline();
+    print("  syscall gate     : ");
+    print_on_off(abi.syscall_gate_present);
+    newline();
+    print("  syscall dpl3     : ");
+    print_on_off(abi.syscall_gate_dpl3);
+    newline();
+    print("  double fault ist : ");
+    print_on_off(abi.double_fault_ist);
+    newline();
+    print_counter("timer vector", abi.pic_timer_vector);
+    print_counter("keyboard vector", abi.pic_keyboard_vector);
+    print_counter("syscall vector", abi.syscall_vector);
+    print_counter("timer irq", counters.timer_irqs);
+    print_counter("keyboard irq", counters.keyboard_irqs);
+    print_counter("default irq", counters.default_irqs);
+    print_counter("exceptions", counters.exceptions);
+}
+
 fn command_boot(_arguments: &[u8]) {
     let snapshot = stats::snapshot();
     let boot_info = multiboot::summary();
@@ -1594,7 +1700,27 @@ fn command_process(_arguments: &[u8]) {
     print_counter("yield calls", scheduler_snapshot.cooperative_yields);
     print_counter("task ticks", scheduler_snapshot.accounted_ticks);
 
+    print_task_rows();
+}
+
+fn command_tasks(_arguments: &[u8]) {
+    let snapshot = process::snapshot();
+    let scheduler_snapshot = scheduler::snapshot();
+
+    serial::log("tasks", "task listing requested");
     println("Tasks:");
+    print_counter("capacity", snapshot.task_capacity);
+    print_counter("used", snapshot.task_slots_used);
+    print_counter("ready", snapshot.ready_tasks);
+    print_counter("running", snapshot.running_tasks);
+    print_counter("exited", snapshot.exited_tasks);
+    print_counter("current", scheduler_snapshot.current_task);
+    print_counter("last", scheduler_snapshot.last_task);
+    print_task_rows();
+}
+
+fn print_task_rows() {
+    println("Task table:");
     for index in 0..process::MAX_TASKS {
         if let Some(task) = process::task(index) {
             print("  #");
@@ -1605,6 +1731,8 @@ fn command_process(_arguments: &[u8]) {
             print_hex_u64(task.entry_point);
             print(" stack=");
             print_hex_u64(task.stack_top);
+            print(" runs=");
+            print_u64(task.runs);
             print(" exit=");
             print_u64(task.exit_code);
             print(" syscalls=");
@@ -1841,6 +1969,57 @@ fn command_heaptest(_arguments: &[u8]) {
         serial::log("heap", "heaptest failed");
         stats::inc_shell_error();
         println("  status            : FAIL");
+    }
+}
+
+fn command_heapcheck(_arguments: &[u8]) {
+    let corruption_ok = heap::corruption_check();
+    let snapshot = heap::snapshot();
+    let low_guard_ok = !paging::translate(snapshot.guard_low).mapped;
+    let high_guard_ok = !paging::translate(snapshot.guard_high).mapped;
+    let accounting_ok = snapshot.allocated_bytes.saturating_add(snapshot.free_bytes)
+        <= snapshot.size
+        && snapshot.used <= snapshot.size
+        && snapshot.remaining <= snapshot.size;
+    let mut passed = 0u64;
+    let mut failed = 0u64;
+
+    serial::log("heap", "heapcheck requested");
+    println("Heap integrity:");
+    selftest_check(
+        "initialized",
+        snapshot.initialized,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check("metadata", snapshot.metadata_ok, &mut passed, &mut failed);
+    selftest_check("sentinel", snapshot.sentinel_ok, &mut passed, &mut failed);
+    selftest_check(
+        "allocation canaries",
+        snapshot.allocation_canaries_ok,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check("guard low", low_guard_ok, &mut passed, &mut failed);
+    selftest_check("guard high", high_guard_ok, &mut passed, &mut failed);
+    selftest_check("accounting", accounting_ok, &mut passed, &mut failed);
+    selftest_check("corruption scan", corruption_ok, &mut passed, &mut failed);
+    print_counter("allocations", snapshot.allocations);
+    print_counter("frees", snapshot.frees);
+    print_counter("active", snapshot.active_allocations);
+    print_counter("free blocks", snapshot.free_blocks);
+    print_counter("largest free", snapshot.largest_free_block);
+    print_counter("corruption checks", snapshot.corruption_checks);
+    print_counter("passed", passed);
+    print_counter("failed", failed);
+
+    if failed == 0 {
+        serial::log("heap", "heapcheck passed");
+        println("status: PASS");
+    } else {
+        serial::log("heap", "heapcheck failed");
+        stats::inc_shell_error();
+        println("status: FAIL");
     }
 }
 
@@ -2177,7 +2356,7 @@ fn command_selftest(_arguments: &[u8]) {
     );
     selftest_check(
         "command table sane",
-        COMMANDS.len() >= 40,
+        COMMANDS.len() >= 46,
         &mut passed,
         &mut failed,
     );
