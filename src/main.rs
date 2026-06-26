@@ -20,6 +20,7 @@ mod scheduler;
 mod serial;
 mod shell;
 mod stats;
+mod syscall;
 mod user;
 mod vga;
 
@@ -180,6 +181,7 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info_addr: u32) ->
     user::init();
     process::init();
     scheduler::init();
+    syscall::init();
 
     vga::init();
     vga::show_splash();

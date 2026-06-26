@@ -3,7 +3,7 @@ use crate::{
     gdt, heap, interrupts, klog, multiboot, paging, paniclog, physmem, scheduler, serial, stats,
     vga,
 };
-use crate::{process, user};
+use crate::{process, syscall, user};
 use x86_64::instructions::interrupts as cpu_interrupts;
 
 const INPUT_BUFFER_SIZE: usize = 512;
@@ -767,6 +767,7 @@ fn command_diag(_arguments: &[u8]) {
     let panic = paniclog::snapshot();
     let process_state = process::snapshot();
     let scheduler_state = scheduler::snapshot();
+    let syscall_state = syscall::snapshot();
     let user_state = user::snapshot();
     let interrupt_abi = interrupts::abi_snapshot();
 
@@ -806,6 +807,9 @@ fn command_diag(_arguments: &[u8]) {
     print_on_off(interrupt_abi_is_healthy(interrupt_abi));
     newline();
     print_counter("syscall vector", interrupt_abi.syscall_vector);
+    print_counter("syscall table", syscall_state.entries);
+    print_counter("syscall dispatch", syscall_state.dispatches);
+    print_counter("syscall unknown", syscall_state.unknown_syscalls);
     print_counter("tasks spawned", process_state.spawned_tasks);
     print_counter("tasks exited", process_state.exited_total);
     print_counter("ctx switches", scheduler_state.context_switches);
@@ -871,6 +875,7 @@ fn print_health_report() -> u64 {
     let panic = paniclog::snapshot();
     let process_state = process::snapshot();
     let scheduler_state = scheduler::snapshot();
+    let syscall_state = syscall::snapshot();
     let user_state = user::snapshot();
     let interrupt_abi = interrupts::abi_snapshot();
     let mut issues = 0u64;
@@ -960,6 +965,11 @@ fn print_health_report() -> u64 {
         &mut issues,
     );
     health_line(
+        "syscall table",
+        syscall_state.initialized && syscall::selftest(),
+        &mut issues,
+    );
+    health_line(
         "kernel log",
         log.initialized && log.count <= log.capacity,
         &mut issues,
@@ -994,6 +1004,7 @@ fn health_issue_count() -> u64 {
     let panic = paniclog::snapshot();
     let process_state = process::snapshot();
     let scheduler_state = scheduler::snapshot();
+    let syscall_state = syscall::snapshot();
     let user_state = user::snapshot();
     let interrupt_abi = interrupts::abi_snapshot();
     let mut issues = 0u64;
@@ -1063,6 +1074,10 @@ fn health_issue_count() -> u64 {
     );
     count_issue(
         scheduler_state.initialized && scheduler_state.current_task == 0 && scheduler::selftest(),
+        &mut issues,
+    );
+    count_issue(
+        syscall_state.initialized && syscall::selftest(),
         &mut issues,
     );
     count_issue(log.initialized && log.count <= log.capacity, &mut issues);
@@ -1619,15 +1634,39 @@ fn command_scheduler(_arguments: &[u8]) {
 }
 
 fn command_syscall(_arguments: &[u8]) {
+    let snapshot = syscall::snapshot();
+
     println("Syscall ABI:");
-    println("  gate      : int 0x80");
-    println("  number    : rax");
-    println("  arg0      : rdi");
-    println("  return    : rax");
-    println("  1 log     : rdi = message id");
-    println("  2 uptime  : return timer ticks");
-    println("  3 exit    : rdi = exit code");
-    println("  4 yield   : cooperative scheduler yield");
+    println("  gate            : int 0x80");
+    println("  number          : rax");
+    println("  arg0            : rdi");
+    println("  return          : rax");
+    print("  table           : ");
+    print_on_off(snapshot.initialized && syscall::selftest());
+    newline();
+    print_counter("entries", snapshot.entries);
+    print_counter("dispatches", snapshot.dispatches);
+    print_counter("unknown", snapshot.unknown_syscalls);
+    print_counter("last number", snapshot.last_number);
+    print_counter("last return", snapshot.last_return);
+
+    println("Syscall table:");
+    for index in 0..syscall::table_len() {
+        if let Some(entry) = syscall::table_entry(index) {
+            print("  ");
+            print_u64(entry.number);
+            print(" ");
+            print(entry.name);
+            print(" args=");
+            print_u64(entry.arg_count as u64);
+            print(" ret=");
+            print(syscall::return_code_name(entry.return_code));
+            print(" log=");
+            print_on_off(entry.logging);
+            print(" handler=on");
+            newline();
+        }
+    }
 }
 
 fn command_gdt(_arguments: &[u8]) {
@@ -1912,6 +1951,7 @@ fn command_selftest(_arguments: &[u8]) {
     let ticks = interrupts::ticks();
     let process_state = process::snapshot();
     let scheduler_state = scheduler::snapshot();
+    let syscall_state = syscall::snapshot();
     let user_state = user::snapshot();
     let interrupt_abi = interrupts::abi_snapshot();
 
@@ -2090,6 +2130,18 @@ fn command_selftest(_arguments: &[u8]) {
     selftest_check(
         "scheduler selftest",
         scheduler::selftest(),
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "syscall table ready",
+        syscall_state.initialized && syscall_state.entries == syscall::table_len() as u64,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "syscall table selftest",
+        syscall::selftest(),
         &mut passed,
         &mut failed,
     );

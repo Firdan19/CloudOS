@@ -1,6 +1,6 @@
 use crate::{
     gdt, heap, interrupts, keyboard, klog, multiboot, paging, physmem, process, scheduler, serial,
-    shell, stats, user, vga,
+    shell, stats, syscall, user, vga,
 };
 use x86_64::instructions::hlt;
 
@@ -128,6 +128,7 @@ fn run_selftest_checks() -> bool {
     let ticks = interrupts::ticks();
     let process_state = process::snapshot();
     let scheduler_state = scheduler::snapshot();
+    let syscall_state = syscall::snapshot();
     let user_state = user::snapshot();
     let interrupt_abi = interrupts::abi_snapshot();
 
@@ -251,6 +252,11 @@ fn run_selftest_checks() -> bool {
     );
     ok &= check("selftest scheduler model", scheduler::selftest());
     ok &= check(
+        "selftest syscall table ready",
+        syscall_state.initialized && syscall_state.entries == syscall::table_len() as u64,
+    );
+    ok &= check("selftest syscall table model", syscall::selftest());
+    ok &= check(
         "selftest kernel log ready",
         log.initialized && log.capacity == klog::ENTRY_COUNT as u64 && log.count > 0,
     );
@@ -303,11 +309,18 @@ fn run_user_mode_checks() -> bool {
             && process_after.last_exit_code == result.exit_code,
     );
     let scheduler_after = scheduler::snapshot();
+    let syscall_after = syscall::snapshot();
     ok &= check(
         "user scheduler accounting",
         scheduler_after.context_switches > 0
             && scheduler_after.cooperative_yields > 0
             && scheduler_after.last_task == result.task_id,
+    );
+    ok &= check(
+        "user syscall table accounting",
+        syscall_after.dispatches >= result.syscalls_after
+            && syscall_after.last_number == syscall::SYSCALL_EXIT
+            && syscall_after.last_return == syscall::RET_OK,
     );
 
     ok

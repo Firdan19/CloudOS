@@ -1,4 +1,4 @@
-use crate::{gdt, interrupts, paging, scheduler, serial, stats};
+use crate::{gdt, interrupts, paging, serial, stats, syscall};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use x86_64::instructions::interrupts as cpu_interrupts;
 
@@ -10,10 +10,6 @@ const USER_CODE_BYTES: [u8; 71] = [
     0x00, 0x00, 0xcd, 0x80, 0xf4, 0xeb, 0xfd,
 ];
 
-const SYSCALL_LOG: u64 = 1;
-const SYSCALL_UPTIME: u64 = 2;
-const SYSCALL_EXIT: u64 = 3;
-const SYSCALL_YIELD: u64 = 4;
 pub const PROBE_EXIT_CODE: u64 = 42;
 
 #[repr(C, align(4096))]
@@ -212,39 +208,22 @@ pub fn probe_expected_exit_code() -> u64 {
     PROBE_EXIT_CODE
 }
 
+pub fn record_syscall() {
+    USER_SYSCALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_uptime_return(ticks: u64) {
+    LAST_UPTIME_RETURN.store(ticks, Ordering::Release);
+}
+
+pub unsafe fn exit_to_kernel(exit_code: u64) -> ! {
+    unsafe { user_return_to_kernel(exit_code) }
+}
+
 #[no_mangle]
 pub extern "C" fn syscall_dispatch_handler(number: u64, arg0: u64, frame: *mut SyscallFrame) {
     let frame = unsafe { &mut *frame };
-    USER_SYSCALLS.fetch_add(1, Ordering::Relaxed);
-    stats::inc_syscall();
-
-    match number {
-        SYSCALL_LOG => {
-            serial::log_u64("syscall", "user log id", arg0);
-            frame.rax = 0;
-        }
-        SYSCALL_UPTIME => {
-            let ticks = interrupts::ticks();
-            LAST_UPTIME_RETURN.store(ticks, Ordering::Release);
-            serial::log_u64("syscall", "uptime ticks", ticks);
-            frame.rax = ticks;
-        }
-        SYSCALL_EXIT => {
-            serial::log_u64("syscall", "exit", arg0);
-            unsafe {
-                user_return_to_kernel(arg0);
-            }
-        }
-        SYSCALL_YIELD => {
-            let current = scheduler::yield_current();
-            serial::log_u64("syscall", "yield", current);
-            frame.rax = 0;
-        }
-        unknown => {
-            serial::log_u64("syscall", "unknown syscall", unknown);
-            frame.rax = u64::MAX;
-        }
-    }
+    syscall::dispatch(number, arg0, frame);
 }
 
 fn write_probe_program() {
