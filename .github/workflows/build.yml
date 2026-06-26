@@ -18,7 +18,7 @@ jobs:
       - name: Install GRUB ISO tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y grub-pc-bin xorriso mtools nasm qemu-system-x86
+          sudo apt-get install -y grub-pc-bin xorriso mtools nasm
       - name: Assemble interrupt stubs
         run: |
           mkdir -p target
@@ -31,44 +31,63 @@ jobs:
           cp grub.cfg iso/boot/grub/grub.cfg
       - name: Create GRUB Multiboot2 ISO
         run: grub-mkrescue -o tobacco.iso iso
-      - name: Prepare CI ISO root
+      - name: Prepare CI kernel test ISOs
         run: |
-          mkdir -p iso-ci/boot/grub
-          cp target/x86_64-unknown-none/release/tobacco-kernel iso-ci/boot/tobacco-kernel
-          cp scripts/grub-ci.cfg iso-ci/boot/grub/grub.cfg
-      - name: Create GRUB Multiboot2 CI ISO
-        run: grub-mkrescue -o tobacco-ci.iso iso-ci
-      - name: Smoke test ISO boot and commands
-        run: sh scripts/ci-smoke-test.sh tobacco-ci.iso serial.log 12
-      - name: Prepare CI Page Fault ISO root
-        run: |
-          mkdir -p iso-ci-pagefault/boot/grub
-          cp target/x86_64-unknown-none/release/tobacco-kernel iso-ci-pagefault/boot/tobacco-kernel
-          cp scripts/grub-ci-pagefault.cfg iso-ci-pagefault/boot/grub/grub.cfg
-      - name: Create GRUB Multiboot2 CI Page Fault ISO
-        run: grub-mkrescue -o tobacco-ci-pagefault.iso iso-ci-pagefault
-      - name: Fault test page fault handler
-        run: sh scripts/ci-fault-test.sh tobacco-ci-pagefault.iso serial-pagefault.log pagefault 8
-      - name: Prepare CI Double Fault ISO root
-        run: |
-          mkdir -p iso-ci-doublefault/boot/grub
-          cp target/x86_64-unknown-none/release/tobacco-kernel iso-ci-doublefault/boot/tobacco-kernel
-          cp scripts/grub-ci-doublefault.cfg iso-ci-doublefault/boot/grub/grub.cfg
-      - name: Create GRUB Multiboot2 CI Double Fault ISO
-        run: grub-mkrescue -o tobacco-ci-doublefault.iso iso-ci-doublefault
-      - name: Fault test double fault handler
-        run: sh scripts/ci-fault-test.sh tobacco-ci-doublefault.iso serial-doublefault.log doublefault 8
-      - name: Upload serial smoke log
-        if: always()
+          for mode in shell syscall userfault heap keyboard pagefault doublefault; do
+            mkdir -p "iso-ci-${mode}/boot/grub"
+            cp target/x86_64-unknown-none/release/tobacco-kernel "iso-ci-${mode}/boot/tobacco-kernel"
+            cp "scripts/grub-ci-${mode}.cfg" "iso-ci-${mode}/boot/grub/grub.cfg"
+            grub-mkrescue -o "tobacco-ci-${mode}.iso" "iso-ci-${mode}"
+          done
+      - name: Upload CI kernel test images
         uses: actions/upload-artifact@v4
         with:
-          name: tobacco-serial-log
+          name: tobacco-ci-images
           path: |
-            serial.log
-            serial-pagefault.log
-            serial-doublefault.log
+            tobacco.iso
+            tobacco-ci-shell.iso
+            tobacco-ci-syscall.iso
+            tobacco-ci-userfault.iso
+            tobacco-ci-heap.iso
+            tobacco-ci-keyboard.iso
+            tobacco-ci-pagefault.iso
+            tobacco-ci-doublefault.iso
           if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         with:
           name: tobacco-iso
           path: tobacco.iso
+
+  kernel-test:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - boot-normal
+          - shell-command-smoke
+          - syscall-probe
+          - user-page-fault
+          - heap-stress
+          - keyboard-model
+          - panic-fault-screen
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86
+      - uses: actions/download-artifact@v4
+        with:
+          name: tobacco-ci-images
+          path: ci-images
+      - name: Run kernel test matrix
+        run: sh scripts/ci-kernel-test.sh "${{ matrix.suite }}" ci-images 12
+      - name: Upload serial matrix log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tobacco-serial-${{ matrix.suite }}
+          path: serial-${{ matrix.suite }}*.log
+          if-no-files-found: ignore

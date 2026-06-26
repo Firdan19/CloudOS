@@ -5,6 +5,11 @@ use crate::{
 use x86_64::instructions::hlt;
 
 const CI_BOOT_FLAG: &[u8] = b"tobacco.ci=smoke";
+const CI_SHELL_FLAG: &[u8] = b"tobacco.ci=shell";
+const CI_SYSCALL_FLAG: &[u8] = b"tobacco.ci=syscall";
+const CI_USER_FAULT_FLAG: &[u8] = b"tobacco.ci=userfault";
+const CI_HEAP_FLAG: &[u8] = b"tobacco.ci=heap";
+const CI_KEYBOARD_FLAG: &[u8] = b"tobacco.ci=keyboard";
 const CI_PAGE_FAULT_FLAG: &[u8] = b"tobacco.ci=pagefault";
 const CI_DOUBLE_FAULT_FLAG: &[u8] = b"tobacco.ci=doublefault";
 const VGA_BUFFER_ADDRESS: u64 = 0x000b_8000;
@@ -26,9 +31,38 @@ pub fn run_if_requested() {
     }
 
     if !contains_bytes(command_line, CI_BOOT_FLAG) {
+        if contains_bytes(command_line, CI_SHELL_FLAG) {
+            run_shell_command_smoke();
+            return;
+        }
+
+        if contains_bytes(command_line, CI_SYSCALL_FLAG) {
+            run_syscall_probe_matrix();
+            return;
+        }
+
+        if contains_bytes(command_line, CI_USER_FAULT_FLAG) {
+            run_user_fault_matrix();
+            return;
+        }
+
+        if contains_bytes(command_line, CI_HEAP_FLAG) {
+            run_heap_stress_matrix();
+            return;
+        }
+
+        if contains_bytes(command_line, CI_KEYBOARD_FLAG) {
+            run_keyboard_model_matrix();
+            return;
+        }
+
         return;
     }
 
+    run_full_smoke();
+}
+
+fn run_full_smoke() {
     serial::log("ci", "command smoke requested");
     run_command_table_checks();
 
@@ -57,6 +91,63 @@ pub fn run_if_requested() {
     }
 
     serial::log("ci", "command smoke complete");
+}
+
+fn run_shell_command_smoke() {
+    serial::log("ci", "shell command smoke requested");
+    run_command_table_checks();
+
+    if run_console_stress_checks() {
+        serial::log("ci", "shell command smoke status: PASS");
+    } else {
+        serial::log("ci", "shell command smoke status: FAIL");
+    }
+
+    serial::log("ci", "shell command smoke complete");
+}
+
+fn run_syscall_probe_matrix() {
+    serial::log("ci", "syscall probe requested");
+    if run_syscall_probe_checks() {
+        serial::log("ci", "syscall probe status: PASS");
+    } else {
+        serial::log("ci", "syscall probe status: FAIL");
+    }
+
+    serial::log("ci", "syscall probe complete");
+}
+
+fn run_user_fault_matrix() {
+    serial::log("ci", "user page fault requested");
+    if run_user_fault_isolation_checks() {
+        serial::log("ci", "user page fault status: PASS");
+    } else {
+        serial::log("ci", "user page fault status: FAIL");
+    }
+
+    serial::log("ci", "user page fault complete");
+}
+
+fn run_heap_stress_matrix() {
+    serial::log("ci", "heap stress requested");
+    if run_heap_stress_checks() {
+        serial::log("ci", "heap stress status: PASS");
+    } else {
+        serial::log("ci", "heap stress status: FAIL");
+    }
+
+    serial::log("ci", "heap stress complete");
+}
+
+fn run_keyboard_model_matrix() {
+    serial::log("ci", "keyboard model requested");
+    if run_keyboard_model_checks() {
+        serial::log("ci", "keyboard model status: PASS");
+    } else {
+        serial::log("ci", "keyboard model status: FAIL");
+    }
+
+    serial::log("ci", "keyboard model complete");
 }
 
 fn trigger_page_fault_for_ci() -> ! {
@@ -284,6 +375,13 @@ fn run_selftest_checks() -> bool {
 }
 
 fn run_user_mode_checks() -> bool {
+    let mut ok = true;
+    ok &= run_syscall_probe_checks();
+    ok &= run_user_fault_isolation_checks();
+    ok
+}
+
+fn run_syscall_probe_checks() -> bool {
     let before = user::snapshot();
     let process_before = process::snapshot();
     let result = process::run_user_probe_task();
@@ -330,6 +428,12 @@ fn run_user_mode_checks() -> bool {
             && syscall_after.last_number == syscall::SYSCALL_EXIT
             && syscall_after.last_return == syscall::RET_OK,
     );
+
+    ok
+}
+
+fn run_user_fault_isolation_checks() -> bool {
+    let mut ok = true;
     let faults_before = user::snapshot().fault_count;
     let fault_result = process::run_user_fault_task();
     let fault_after = user::snapshot();
@@ -419,6 +523,35 @@ fn run_stability_stress() -> bool {
     ok
 }
 
+fn run_heap_stress_checks() -> bool {
+    let before = heap::snapshot();
+    let mut ok = true;
+
+    ok &= check(
+        "heap stress initialized",
+        before.initialized
+            && before.mapped_pages == heap::HEAP_PAGES
+            && before.metadata_ok
+            && before.sentinel_ok
+            && before.allocation_canaries_ok,
+    );
+    ok &= check("heap stress free coalesce", heap::selftest());
+    ok &= check("heap stress corruption guard", heap::corruption_check());
+    ok &= check("heap stress allocator reuse", heap::stress());
+
+    let after = heap::snapshot();
+    ok &= check(
+        "heap stress accounting stable",
+        after.initialized
+            && after.used <= after.size
+            && after.remaining <= after.size
+            && after.allocated_bytes.saturating_add(after.free_bytes) <= after.size
+            && after.corruption_failures == before.corruption_failures,
+    );
+
+    ok
+}
+
 fn run_console_stress_checks() -> bool {
     let report = shell::run_console_model_checks();
     let mut ok = true;
@@ -473,6 +606,39 @@ fn run_console_stress_checks() -> bool {
         "console render wrapped input",
         stats_after_render.vga_cell_writes > stats_before_render.vga_cell_writes,
     );
+
+    ok
+}
+
+fn run_keyboard_model_checks() -> bool {
+    let report = shell::run_console_model_checks();
+    let counters = stats::snapshot();
+    let mut ok = true;
+
+    ok &= check(
+        "keyboard model command exists",
+        shell::command_exists(b"keyboard"),
+    );
+    ok &= check(
+        "keyboard model queue sane",
+        keyboard::pending_events() < 256,
+    );
+    ok &= check(
+        "keyboard model scancode counter sane",
+        counters.keyboard_scancodes <= 1_000_000,
+    );
+    ok &= check(
+        "keyboard model dropped bounded",
+        counters.keyboard_dropped_events <= counters.keyboard_events.saturating_add(256),
+    );
+    ok &= check("keyboard model long input", report.long_input);
+    ok &= check("keyboard model long backspace", report.backspace_long);
+    ok &= check("keyboard model line editing", report.line_editing);
+    ok &= check(
+        "keyboard model history navigation",
+        report.history_navigation,
+    );
+    ok &= check("keyboard model command lookup", report.command_lookup);
 
     ok
 }
