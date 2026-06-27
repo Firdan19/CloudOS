@@ -1,4 +1,26 @@
-# Tobacco
+<p align="center">
+  <img src="assets/brand/tobacco-logo.png" width="150" alt="Tobacco leaf logo">
+</p>
+
+<h1 align="center">Tobacco</h1>
+
+<p align="center">
+  <strong>Kernel foundation yang kecil, nyata, dan terus diperkeras</strong><br>
+  Rust · x86_64 · Multiboot2 · no_std
+</p>
+
+<p align="center">
+  <a href="https://github.com/Firdan19/Tobacco/actions/workflows/build.yml"><img src="https://github.com/Firdan19/Tobacco/actions/workflows/build.yml/badge.svg" alt="Build Tobacco Kernel"></a>
+</p>
+
+<table align="center">
+  <tr>
+    <td align="center"><strong>Version</strong><br><code>v0.0.5</code></td>
+    <td align="center"><strong>Phase</strong><br>1 · Foundation</td>
+    <td align="center"><strong>Architecture</strong><br><code>x86_64</code></td>
+    <td align="center"><strong>CI Matrix</strong><br>9 kernel tests</td>
+  </tr>
+</table>
 
 Token AI berlebihan? Sepertinya seru untuk membangun OS
 
@@ -10,200 +32,92 @@ Kalau kamu profesional, pelajar, engineer, researcher, dokumentator, atau sekada
 
 Proyek ini masih receh, tapi seru untuk dibangun bersama silahkan habiskan token AI mu jika bersedi salam hangat
 
-## Status Saat Ini
+## Fondasi yang Sudah Hidup
 
-Tobacco berada di Phase 1 - Kernel Foundation Hardening
+<table>
+  <tr>
+    <td width="25%" valign="top">
+      <strong>Boot & CPU</strong><br><br>
+      GRUB Multiboot2<br>
+      Long mode 64-bit<br>
+      Stack dan paging awal<br>
+      GDT · TSS · IST<br>
+      IDT · PIC · PIT
+    </td>
+    <td width="25%" valign="top">
+      <strong>Memory</strong><br><br>
+      Multiboot memory map<br>
+      Physical frame allocator<br>
+      Virtual map dan unmap<br>
+      Kernel heap<br>
+      Guard page dan audit
+    </td>
+    <td width="25%" valign="top">
+      <strong>Process</strong><br><br>
+      Ring 3 user mode<br>
+      ELF64 loader<br>
+      Initramfs dan <code>/bin/init</code><br>
+      Private CR3 per process<br>
+      Spawn · yield · exit
+    </td>
+    <td width="25%" valign="top">
+      <strong>Reliability</strong><br><br>
+      Panic dan exception screen<br>
+      User fault isolation<br>
+      Serial dan kernel ring log<br>
+      Selftest dan stress test<br>
+      9-job CI kernel matrix
+    </td>
+  </tr>
+</table>
 
-Versi saat ini v0.0.5
+## Terminal Mini
 
-Tobacco saat ini masih fokus pada fondasi kernel
+<table>
+  <tr>
+    <td><strong>Console</strong><br>VGA text mode · PS/2 keyboard · cursor · wrapping · scroll region</td>
+    <td><strong>Editor</strong><br>Line editing · backspace · history naik turun · parser case-insensitive</td>
+    <td><strong>Observability</strong><br>Health · diagnostics · build metadata · process lifecycle · fault reports</td>
+  </tr>
+</table>
 
-Belum masuk ke GUI, filesystem besar, user space kompleks, plugin, atau AI service
+## Command Utama
 
-## Yang Sudah Selesai
+| Sistem | Memory | Process | Debug dan Test |
+|---|---|---|---|
+| `help` `version` `about` `buildinfo` | `mem` `mmap` `frames` `paging` | `process` `tasks` `sched` `spawn` | `health` `diag` `log` `faults` |
+| `uptime` `ticks` `sysinfo` `boot` | `heap` `heapcheck` `virt` `vmtest` | `lifecycle` `lifecycletest` `elftest` | `selftest` `stress` `consoletest` `faulttest` |
 
-- Boot via GRUB Multiboot2 ISO
-- Kernel Rust `no_std` dan `no_main`
-- Target `x86_64-unknown-none`
-- Long mode 64-bit
-- Stack awal aktif
-- Paging awal dan identity mapping
-- VGA text console
-- Keyboard PS/2 via interrupt
-- Shell mini interaktif
-- Command parser berbasis command table
-- Line editor dasar
-- Command history
-- Serial logging via COM1
-- Structured serial log
-- Kernel ring log
-- IDT
-- PIC 8259
-- PIT timer
-- GDT
-- TSS
-- IST untuk fault handling
-- Ring 3 user mode probe
-- ELF64 user program loader
-- Validasi header dan segment `PT_LOAD`
-- Permission user page W^X dan NX
-- Initramfs read-only format CPIO `newc`
-- `/bin/init` dimuat sebagai Multiboot2 module
-- `/bin/init` dijalankan otomatis di Ring 3
-- Process lifecycle `spawn`, `yield`, dan `exit`
-- Address space privat per process dengan CR3 terpisah
-- Isolasi frame user antar process
-- Cleanup page table, user frame, dan heap saat process exit
-- Lifecycle isolation selftest untuk dua process
-- User page mapping terbatas
-- Syscall gate `int 0x80`
-- Minimal syscall ABI
-- Panic screen
-- Exception screen
-- Page fault handler
-- Double fault handler
-- Controlled page fault test
-- Controlled double fault test
-- Memory map parsing dari Multiboot2
-- Physical frame allocator awal
-- Paging inspector
-- Virtual page map dan unmap awal
-- Kernel heap awal
-- Guard page untuk heap
-- Health command
-- Status command
-- Diagnostic command
-- Last panic snapshot
-- Build info command
-- Selftest command
-- Stress test command
-- GitHub Actions build ISO
-- CI smoke test
-- CI stress test
-- CI fault test
-- CI kernel test matrix
-- CI khusus ELF loader dan initramfs
-
-## Command yang Tersedia
-
-- `help`
-- `clear`
-- `version`
-- `about`
-- `echo`
-- `uptime`
-- `health`
-- `status`
-- `diag`
-- `lastpanic`
-- `buildinfo`
-- `sysinfo`
-- `mem`
-- `memmap`
-- `frames`
-- `frame`
-- `ticks`
-- `keyboard`
-- `consoletest`
-- `perf`
-- `irq`
-- `boot`
-- `user`
-- `elf`
-- `elftest`
-- `spawn`
-- `initramfs`
-- `process`
-- `tasks`
-- `lifecycle`
-- `lifecycletest`
-- `sched`
-- `usertest`
-- `syscall`
-- `gdt`
-- `paging`
-- `heap`
-- `virt`
-- `vmtest`
-- `log`
-- `dmesg`
-- `selftest`
-- `stress`
-- `bench`
+Gunakan `help` di Tobacco untuk melihat seluruh command yang tersedia
 
 ## Build
 
-Build utama dilakukan lewat GitHub Actions
-
-Artifact yang dihasilkan
-
-```text
-tobacco-iso
-```
-
-Isi artifact
-
-```text
-tobacco.iso
-```
-
-## Menjalankan di QEMU
-
-Setelah artifact diunduh dan diekstrak
+Build utama berjalan melalui GitHub Actions dan menghasilkan artifact `tobacco-iso` berisi `tobacco.iso`
 
 ```sh
 qemu-system-x86_64 -boot d -cdrom tobacco.iso
 ```
 
-Mode aman yang dipakai untuk pengembangan saat ini tidak memberi akses disk fisik ke QEMU
-
-Aturan aman
+QEMU dijalankan tanpa akses ke disk fisik
 
 - Jangan arahkan QEMU ke `/dev/disk`
 - Jangan gunakan `-drive file=/dev/...`
-- Jangan format disk
-- Jangan install bootloader ke disk laptop
-- Jangan beri akses USB atau disk fisik ke QEMU
+- Jangan format atau memasang bootloader ke disk laptop
+- Jangan memberi QEMU akses USB atau disk fisik
 
-## Roadmap Phase 1
+## Fokus Phase 1 Berikutnya
+
+<table>
+  <tr>
+    <td><strong>Scheduling</strong><br>Preemptive context switch dan accounting yang lebih matang</td>
+    <td><strong>Process Tree</strong><br>Parent · child · wait · reaping</td>
+    <td><strong>Isolation</strong><br>Fault policy per address space dan cleanup tahan gagal</td>
+    <td><strong>IPC</strong><br>Primitive komunikasi kernel yang kecil dan terukur</td>
+  </tr>
+</table>
 
 Tobacco tetap berada di Phase 1 sampai fondasi kernel benar-benar kokoh
 
-Target berikutnya
-
-- Syscall ABI lanjutan
-- Memory isolation lebih matang
-- Lifecycle `/bin/init` jangka panjang
-- Preemptive context switch
-- Process parent dan child
-- Wait dan process reaping
-- IPC dasar
-- Fault isolation untuk user process
-- CI test untuk user mode dan syscall
-
-## Arah Jangka Panjang
-
-| Lapisan | Bahasa | Catatan |
-|---|---|---|
-| Kernel inti | Rust + C | Rust untuk keamanan memori, C untuk kontrol rendah jika diperlukan |
-| Driver | C + Rust | Akses hardware rendah dan logika driver yang lebih aman |
-| User space tools | Go | Untuk shell lanjutan, daemon, dan agent |
-| Plugin aplikasi | WASM | Sandbox aman dan cross-platform |
-| CloudFS | Zig | Eksperimen filesystem ringan dan portable |
-| GUI | Rust | Display server dan compositor |
-| AI service | Rust + Go | Service user space, bukan langsung di ring 0 |
-
 ## Kontribusi
 
-Kontribusi terbuka untuk siapa pun yang ingin ikut membangun, menguji, membaca, mengkritik, atau sekadar memberi ide
-
-Bisa mulai dari hal kecil
-
-- Review kode
-- Dokumentasi
-- Test di QEMU
-- Ide arsitektur
-- Perbaikan bug
-- CI improvement
-- Eksperimen driver
-- Diskusi kernel, memory, scheduler, syscall, atau security
+Review kode, dokumentasi, test QEMU, ide arsitektur, perbaikan bug, eksperimen driver, dan kritik teknis semuanya diterima
