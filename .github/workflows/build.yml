@@ -43,7 +43,7 @@ jobs:
         run: grub-mkrescue -o tobacco.iso iso
       - name: Prepare CI kernel test ISOs
         run: |
-          for mode in shell syscall userfault heap keyboard pagefault doublefault; do
+          for mode in shell syscall elf userfault heap keyboard pagefault doublefault; do
             mkdir -p "iso-ci-${mode}/boot/grub"
             cp target/x86_64-unknown-none/release/tobacco-kernel "iso-ci-${mode}/boot/tobacco-kernel"
             cp "scripts/grub-ci-${mode}.cfg" "iso-ci-${mode}/boot/grub/grub.cfg"
@@ -57,6 +57,7 @@ jobs:
             tobacco.iso
             tobacco-ci-shell.iso
             tobacco-ci-syscall.iso
+            tobacco-ci-elf.iso
             tobacco-ci-userfault.iso
             tobacco-ci-heap.iso
             tobacco-ci-keyboard.iso
@@ -78,6 +79,7 @@ jobs:
           - boot-normal
           - shell-command-smoke
           - syscall-probe
+          - elf-loader
           - user-page-fault
           - heap-stress
           - keyboard-model

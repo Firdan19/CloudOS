@@ -106,10 +106,12 @@ pub fn init() -> Snapshot {
     let code_mapped = map_probe_page(
         paging::USER_PROBE_CODE_PAGE,
         page_address(core::ptr::addr_of!(USER_CODE_PAGE)),
+        paging::UserPagePermissions::READ_EXECUTE,
     );
     let stack_mapped = map_probe_page(
         paging::USER_PROBE_STACK_PAGE,
         page_address(core::ptr::addr_of!(USER_STACK_PAGE)),
+        paging::UserPagePermissions::READ_WRITE,
     );
 
     USER_CODE_MAPPED.store(code_mapped, Ordering::Release);
@@ -160,6 +162,15 @@ pub fn snapshot() -> Snapshot {
 }
 
 pub fn run_entry(entry_point: u64, stack_top: u64) -> ProbeResult {
+    run_program(entry_point, stack_top, PROBE_EXIT_CODE, 4)
+}
+
+pub fn run_program(
+    entry_point: u64,
+    stack_top: u64,
+    expected_exit_code: u64,
+    minimum_syscalls: u64,
+) -> ProbeResult {
     let before = USER_SYSCALLS.load(Ordering::Acquire);
 
     if !USER_READY.load(Ordering::Acquire) || !interrupts::syscall_gate_ready() {
@@ -188,7 +199,8 @@ pub fn run_entry(entry_point: u64, stack_top: u64) -> ProbeResult {
 
     LAST_EXIT_CODE.store(exit_code, Ordering::Release);
     let after = USER_SYSCALLS.load(Ordering::Acquire);
-    let passed = exit_code == PROBE_EXIT_CODE && after >= before.saturating_add(4);
+    let passed =
+        exit_code == expected_exit_code && after >= before.saturating_add(minimum_syscalls);
 
     if passed {
         USER_PASSES.fetch_add(1, Ordering::Relaxed);
@@ -291,13 +303,17 @@ unsafe fn write_fault_program(destination: *mut u8) {
     }
 }
 
-fn map_probe_page(virt: u64, phys: u64) -> bool {
+fn map_probe_page(virt: u64, phys: u64, permissions: paging::UserPagePermissions) -> bool {
     let translation = paging::translate(virt);
     if translation.mapped {
-        return translation.phys == phys && translation.user_accessible;
+        return translation.phys == phys
+            && translation.user_accessible
+            && translation.writable == permissions.writable
+            && translation.executable == permissions.executable;
     }
 
-    paging::map_user_page(virt, phys).is_ok() && paging::translate(virt).user_accessible
+    paging::map_user_page_with_permissions(virt, phys, permissions).is_ok()
+        && paging::translate(virt).user_accessible
 }
 
 fn page_address<T>(pointer: *const T) -> u64 {

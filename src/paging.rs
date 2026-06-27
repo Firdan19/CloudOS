@@ -21,14 +21,21 @@ pub const USER_SPACE_END: u64 = USER_SPACE_BASE + USER_SPACE_SIZE;
 pub const USER_PROBE_CODE_PAGE: u64 = USER_SPACE_BASE;
 pub const USER_PROBE_STACK_PAGE: u64 = USER_SPACE_BASE + PAGE_SIZE_4K;
 pub const USER_PROBE_STACK_TOP: u64 = USER_PROBE_STACK_PAGE + PAGE_SIZE_4K;
+pub const USER_ELF_BASE: u64 = USER_SPACE_BASE + 0x0010_0000;
+pub const USER_ELF_SIZE: u64 = 0x0010_0000;
+pub const USER_ELF_END: u64 = USER_ELF_BASE + USER_ELF_SIZE;
+pub const USER_ELF_STACK_GUARD: u64 = USER_ELF_END;
+pub const USER_ELF_STACK_PAGE: u64 = USER_ELF_STACK_GUARD + PAGE_SIZE_4K;
+pub const USER_ELF_STACK_TOP: u64 = USER_ELF_STACK_PAGE + PAGE_SIZE_4K;
 
 const PAGE_TABLE_ENTRIES: usize = 512;
 const ENTRY_PRESENT: u64 = 1 << 0;
 const ENTRY_WRITABLE: u64 = 1 << 1;
 const ENTRY_USER: u64 = 1 << 2;
 const ENTRY_HUGE_PAGE: u64 = 1 << 7;
+const ENTRY_NO_EXECUTE: u64 = 1 << 63;
 const DEFAULT_PAGE_FLAGS: u64 = ENTRY_PRESENT | ENTRY_WRITABLE;
-const USER_PAGE_FLAGS: u64 = DEFAULT_PAGE_FLAGS | ENTRY_USER;
+const USER_DATA_PAGE_FLAGS: u64 = DEFAULT_PAGE_FLAGS | ENTRY_USER | ENTRY_NO_EXECUTE;
 const ENTRY_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 const HUGE_ENTRY_ADDR_MASK: u64 = 0x000f_ffff_ffe0_0000;
 pub const MAX_TRACKED_MAPPINGS: usize = 128;
@@ -75,7 +82,38 @@ pub struct TranslateResult {
     pub mapped: bool,
     pub huge_page: bool,
     pub user_accessible: bool,
+    pub writable: bool,
+    pub executable: bool,
     pub page_size: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct UserPagePermissions {
+    pub writable: bool,
+    pub executable: bool,
+}
+
+impl UserPagePermissions {
+    pub const READ_EXECUTE: Self = Self {
+        writable: false,
+        executable: true,
+    };
+
+    pub const READ_WRITE: Self = Self {
+        writable: true,
+        executable: false,
+    };
+
+    fn flags(self) -> u64 {
+        let mut flags = ENTRY_PRESENT | ENTRY_USER;
+        if self.writable {
+            flags |= ENTRY_WRITABLE;
+        }
+        if !self.executable {
+            flags |= ENTRY_NO_EXECUTE;
+        }
+        flags
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -109,7 +147,7 @@ pub enum PageOwner {
 impl PageOwner {
     fn default_flags(self) -> u64 {
         match self {
-            PageOwner::User => USER_PAGE_FLAGS,
+            PageOwner::User => USER_DATA_PAGE_FLAGS,
             PageOwner::Kernel | PageOwner::Heap | PageOwner::Test => DEFAULT_PAGE_FLAGS,
         }
     }
@@ -122,6 +160,7 @@ pub struct MappingInfo {
     pub owner: PageOwner,
     pub user_accessible: bool,
     pub writable: bool,
+    pub executable: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -163,6 +202,7 @@ impl MappingRecord {
             owner: self.owner,
             user_accessible: self.flags & ENTRY_USER != 0,
             writable: self.flags & ENTRY_WRITABLE != 0,
+            executable: self.flags & ENTRY_NO_EXECUTE == 0,
         }
     }
 }
@@ -363,6 +403,8 @@ pub fn translate(virt: u64) -> TranslateResult {
         return unmapped(virt);
     }
     let mut user_accessible = entry_user(p4_entry);
+    let mut writable = entry_writable(p4_entry);
+    let mut executable = !entry_no_execute(p4_entry);
 
     let Some(p3) = table_from_entry(p4_entry) else {
         return unmapped(virt);
@@ -373,6 +415,8 @@ pub fn translate(virt: u64) -> TranslateResult {
         return unmapped(virt);
     }
     user_accessible &= entry_user(p3_entry);
+    writable &= entry_writable(p3_entry);
+    executable &= !entry_no_execute(p3_entry);
 
     let Some(p2) = table_from_entry(p3_entry) else {
         return unmapped(virt);
@@ -383,6 +427,8 @@ pub fn translate(virt: u64) -> TranslateResult {
         return unmapped(virt);
     }
     user_accessible &= entry_user(p2_entry);
+    writable &= entry_writable(p2_entry);
+    executable &= !entry_no_execute(p2_entry);
 
     if entry_huge(p2_entry) {
         return TranslateResult {
@@ -391,6 +437,8 @@ pub fn translate(virt: u64) -> TranslateResult {
             mapped: true,
             huge_page: true,
             user_accessible: user_accessible && entry_user(p2_entry),
+            writable: writable && entry_writable(p2_entry),
+            executable: executable && !entry_no_execute(p2_entry),
             page_size: HUGE_PAGE_SIZE,
         };
     }
@@ -404,6 +452,8 @@ pub fn translate(virt: u64) -> TranslateResult {
         return unmapped(virt);
     }
     user_accessible &= entry_user(p1_entry);
+    writable &= entry_writable(p1_entry);
+    executable &= !entry_no_execute(p1_entry);
 
     TranslateResult {
         virt,
@@ -411,6 +461,8 @@ pub fn translate(virt: u64) -> TranslateResult {
         mapped: true,
         huge_page: false,
         user_accessible,
+        writable,
+        executable,
         page_size: PAGE_SIZE_4K,
     }
 }
@@ -420,12 +472,20 @@ pub fn map_new_page(virt: u64) -> Result<u64, MapError> {
 }
 
 pub fn map_new_page_owned(virt: u64, owner: PageOwner) -> Result<u64, MapError> {
+    map_new_page_with_flags(virt, owner.default_flags(), owner)
+}
+
+pub fn map_new_user_page(virt: u64, permissions: UserPagePermissions) -> Result<u64, MapError> {
+    map_new_page_with_flags(virt, permissions.flags(), PageOwner::User)
+}
+
+fn map_new_page_with_flags(virt: u64, flags: u64, owner: PageOwner) -> Result<u64, MapError> {
     cpu_interrupts::without_interrupts(|| {
         if !is_page_aligned(virt) {
             return Err(MapError::VirtualUnaligned);
         }
 
-        if !in_mappable_virtual_range(virt, owner.default_flags()) {
+        if !in_mappable_virtual_range(virt, flags) {
             return Err(MapError::OutsideManagedRange);
         }
 
@@ -440,7 +500,7 @@ pub fn map_new_page_owned(virt: u64, owner: PageOwner) -> Result<u64, MapError> 
         }
 
         zero_frame(phys);
-        if let Err(error) = map_page_inner_with_owner(virt, phys, owner) {
+        if let Err(error) = map_page_inner_with_flags(virt, phys, flags, owner) {
             let _ = physmem::free_frame(phys);
             return Err(error);
         }
@@ -454,7 +514,17 @@ pub fn map_page(virt: u64, phys: u64) -> Result<(), MapError> {
 }
 
 pub fn map_user_page(virt: u64, phys: u64) -> Result<(), MapError> {
-    cpu_interrupts::without_interrupts(|| map_page_inner_with_owner(virt, phys, PageOwner::User))
+    map_user_page_with_permissions(virt, phys, UserPagePermissions::READ_WRITE)
+}
+
+pub fn map_user_page_with_permissions(
+    virt: u64,
+    phys: u64,
+    permissions: UserPagePermissions,
+) -> Result<(), MapError> {
+    cpu_interrupts::without_interrupts(|| {
+        map_page_inner_with_flags(virt, phys, permissions.flags(), PageOwner::User)
+    })
 }
 
 pub fn unmap_page(virt: u64) -> Result<u64, UnmapError> {
@@ -561,6 +631,8 @@ fn unmapped(virt: u64) -> TranslateResult {
         mapped: false,
         huge_page: false,
         user_accessible: false,
+        writable: false,
+        executable: false,
         page_size: 0,
     }
 }
@@ -750,7 +822,9 @@ fn permission_audit_inner(state: &MapperState) -> PermissionAudit {
         let mut ok = translated.mapped
             && translated.phys == record.phys
             && translated.page_size == PAGE_SIZE_4K
-            && translated.user_accessible == (record.flags & ENTRY_USER != 0);
+            && translated.user_accessible == (record.flags & ENTRY_USER != 0)
+            && translated.writable == (record.flags & ENTRY_WRITABLE != 0)
+            && translated.executable == (record.flags & ENTRY_NO_EXECUTE == 0);
 
         match record.owner {
             PageOwner::User => {
@@ -798,7 +872,7 @@ fn ensure_next_table(
     }
 
     zero_frame(frame);
-    *entry = frame | flags;
+    *entry = frame | ENTRY_PRESENT | (flags & (ENTRY_WRITABLE | ENTRY_USER));
     let state = mapper_state_mut();
     state.page_table_frames = state.page_table_frames.saturating_add(1);
 
@@ -877,6 +951,14 @@ fn entry_huge(entry: u64) -> bool {
 
 fn entry_user(entry: u64) -> bool {
     entry & ENTRY_USER != 0
+}
+
+fn entry_writable(entry: u64) -> bool {
+    entry & ENTRY_WRITABLE != 0
+}
+
+fn entry_no_execute(entry: u64) -> bool {
+    entry & ENTRY_NO_EXECUTE != 0
 }
 
 fn entry_addr(entry: u64) -> u64 {

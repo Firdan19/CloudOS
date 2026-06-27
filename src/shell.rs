@@ -1,7 +1,7 @@
 use crate::keyboard::{self, KeyEvent};
 use crate::{
-    buildinfo, gdt, heap, interrupts, klog, multiboot, paging, paniclog, physmem, scheduler,
-    serial, stats, vga,
+    buildinfo, elf, gdt, heap, interrupts, klog, multiboot, paging, paniclog, physmem, scheduler,
+    serial, stats, user_program, vga,
 };
 use crate::{process, syscall, user};
 use x86_64::instructions::interrupts as cpu_interrupts;
@@ -20,7 +20,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 47] = [
+const COMMANDS: [Command; 49] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -145,6 +145,16 @@ const COMMANDS: [Command; 47] = [
         name: "user",
         description: "status Ring 3 dan user mode",
         handler: command_user,
+    },
+    Command {
+        name: "elf",
+        description: "status loader ELF64 user",
+        handler: command_elf,
+    },
+    Command {
+        name: "elftest",
+        description: "jalankan ELF /init di Ring 3",
+        handler: command_elftest,
     },
     Command {
         name: "process",
@@ -1072,7 +1082,7 @@ fn print_health_report() -> u64 {
         keyboard::pending_events() < 256,
         &mut issues,
     );
-    health_line("command table", COMMANDS.len() >= 47, &mut issues);
+    health_line("command table", COMMANDS.len() >= 49, &mut issues);
     health_line("last panic", !panic.present, &mut issues);
 
     issues
@@ -1174,7 +1184,7 @@ fn health_issue_count() -> u64 {
     );
     count_issue(ticks >= counters.shell_ready_tick, &mut issues);
     count_issue(keyboard::pending_events() < 256, &mut issues);
-    count_issue(COMMANDS.len() >= 47, &mut issues);
+    count_issue(COMMANDS.len() >= 49, &mut issues);
     count_issue(!panic.present, &mut issues);
 
     issues
@@ -1665,6 +1675,83 @@ fn command_user(_arguments: &[u8]) {
     print_counter("tasks spawned", process_state.spawned_tasks);
     print_counter("tasks exited", process_state.exited_total);
     print_counter("last task", process_state.last_task_id);
+}
+
+fn command_elf(_arguments: &[u8]) {
+    let snapshot = elf::snapshot();
+    let text = paging::translate(snapshot.entry_point);
+    let data = paging::translate(paging::USER_ELF_BASE + paging::PAGE_SIZE_4K);
+    let stack = paging::translate(paging::USER_ELF_STACK_PAGE);
+
+    println("ELF64 user loader:");
+    print("  initialized      : ");
+    print_on_off(snapshot.initialized);
+    newline();
+    print("  image loaded     : ");
+    print_on_off(snapshot.loaded);
+    newline();
+    print("  entry point      : ");
+    print_hex_u64(snapshot.entry_point);
+    newline();
+    print("  image range      : ");
+    print_hex_u64(snapshot.image_start);
+    print(" - ");
+    print_hex_u64(snapshot.image_end);
+    newline();
+    print_counter("PT_LOAD segments", snapshot.load_segments);
+    print_counter("mapped pages", snapshot.mapped_pages);
+    print_counter("executable pages", snapshot.executable_pages);
+    print_counter("writable pages", snapshot.writable_pages);
+    print("  text RX          : ");
+    print_on_off(text.mapped && text.user_accessible && text.executable && !text.writable);
+    newline();
+    print("  data RW + NX     : ");
+    print_on_off(data.mapped && data.user_accessible && data.writable && !data.executable);
+    newline();
+    print("  stack RW + NX    : ");
+    print_on_off(stack.mapped && stack.user_accessible && stack.writable && !stack.executable);
+    newline();
+    print("  stack guard      : ");
+    print_on_off(!paging::translate(paging::USER_ELF_STACK_GUARD).mapped);
+    newline();
+    print("  loader selftest  : ");
+    print_on_off(elf::selftest());
+    newline();
+
+    if let Some(error) = snapshot.last_error {
+        print("  last error       : ");
+        println(elf::load_error_name(error));
+    }
+}
+
+fn command_elftest(_arguments: &[u8]) {
+    let result = process::run_elf_init_task();
+
+    println("ELF64 /init process:");
+    print("  ran              : ");
+    print_on_off(result.ran);
+    newline();
+    print_counter("task id", result.task_id);
+    print("  task state       : ");
+    println(process::state_name(result.state));
+    print("  entry point      : ");
+    print_hex_u64(result.entry_point);
+    newline();
+    print("  stack top        : ");
+    print_hex_u64(result.stack_top);
+    newline();
+    print_counter("exit code", result.exit_code);
+    print_counter("expected exit", user_program::INIT_EXPECTED_EXIT_CODE);
+    print_counter("syscalls before", result.syscalls_before);
+    print_counter("syscalls after", result.syscalls_after);
+    print("  status           : ");
+
+    if result.passed {
+        println("PASS");
+    } else {
+        stats::inc_shell_error();
+        println("FAIL");
+    }
 }
 
 fn command_usertest(_arguments: &[u8]) {
@@ -2184,6 +2271,7 @@ fn command_selftest(_arguments: &[u8]) {
     let scheduler_state = scheduler::snapshot();
     let syscall_state = syscall::snapshot();
     let user_state = user::snapshot();
+    let elf_state = elf::snapshot();
     let interrupt_abi = interrupts::abi_snapshot();
 
     let mut passed = 0u64;
@@ -2339,6 +2427,17 @@ fn command_selftest(_arguments: &[u8]) {
         &mut failed,
     );
     selftest_check(
+        "ELF64 user loader",
+        elf_state.initialized
+            && elf_state.loaded
+            && elf_state.load_segments >= 1
+            && elf_state.executable_pages >= 1
+            && elf_state.writable_pages >= 1
+            && elf::selftest(),
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
         "process table ready",
         process_state.initialized && process_state.task_capacity == process::MAX_TASKS as u64,
         &mut passed,
@@ -2408,7 +2507,7 @@ fn command_selftest(_arguments: &[u8]) {
     );
     selftest_check(
         "command table sane",
-        COMMANDS.len() >= 47,
+        COMMANDS.len() >= 49,
         &mut passed,
         &mut failed,
     );

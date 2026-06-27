@@ -1,4 +1,4 @@
-use crate::{scheduler, serial, user};
+use crate::{elf, scheduler, serial, user, user_program};
 use core::cell::UnsafeCell;
 use x86_64::instructions::interrupts as cpu_interrupts;
 
@@ -144,14 +144,19 @@ impl ProcessTable {
     }
 
     fn spawn_user_probe(&mut self) -> Option<Task> {
-        self.spawn_user_program(user::probe_entry_point())
+        self.spawn_user_program(user::probe_entry_point(), user::probe_stack_top())
     }
 
     fn spawn_user_fault_probe(&mut self) -> Option<Task> {
-        self.spawn_user_program(user::fault_entry_point())
+        self.spawn_user_program(user::fault_entry_point(), user::probe_stack_top())
     }
 
-    fn spawn_user_program(&mut self, entry_point: u64) -> Option<Task> {
+    fn spawn_elf_init(&mut self) -> Option<Task> {
+        let image = elf::loaded_image()?;
+        self.spawn_user_program(image.entry_point, image.stack_top)
+    }
+
+    fn spawn_user_program(&mut self, entry_point: u64, stack_top: u64) -> Option<Task> {
         if !self.initialized {
             self.init();
         }
@@ -169,7 +174,7 @@ impl ProcessTable {
             id,
             state: TaskState::Ready,
             entry_point,
-            stack_top: user::probe_stack_top(),
+            stack_top,
             exit_code: 0,
             syscalls_before: 0,
             syscalls_after: 0,
@@ -410,6 +415,75 @@ pub fn run_user_fault_task() -> TaskRunResult {
     }
 }
 
+pub fn run_elf_init_task() -> TaskRunResult {
+    let image = elf::loaded_image();
+    let fallback_entry = image.map(|loaded| loaded.entry_point).unwrap_or(0);
+    let fallback_stack = image.map(|loaded| loaded.stack_top).unwrap_or(0);
+    let Some(task) = cpu_interrupts::without_interrupts(|| table_mut().spawn_elf_init()) else {
+        return TaskRunResult {
+            ran: false,
+            passed: false,
+            task_id: 0,
+            state: TaskState::Empty,
+            entry_point: fallback_entry,
+            stack_top: fallback_stack,
+            exit_code: 0,
+            syscalls_before: user::snapshot().syscall_count,
+            syscalls_after: user::snapshot().syscall_count,
+        };
+    };
+
+    let syscalls_before = user::snapshot().syscall_count;
+    let running =
+        cpu_interrupts::without_interrupts(|| table_mut().mark_running(task.id, syscalls_before));
+    if !running {
+        return TaskRunResult {
+            ran: false,
+            passed: false,
+            task_id: task.id,
+            state: TaskState::Ready,
+            entry_point: task.entry_point,
+            stack_top: task.stack_top,
+            exit_code: 0,
+            syscalls_before,
+            syscalls_after: syscalls_before,
+        };
+    }
+
+    serial::log("elf", "entering ELF64 user entry point");
+    let user_result = user::run_program(
+        task.entry_point,
+        task.stack_top,
+        user_program::INIT_EXPECTED_EXIT_CODE,
+        user_program::INIT_MINIMUM_SYSCALLS,
+    );
+    let exited_task = cpu_interrupts::without_interrupts(|| {
+        table_mut().mark_exited(task.id, user_result.exit_code, user_result.syscalls_after)
+    });
+    let state = exited_task
+        .map(|finished| finished.state)
+        .unwrap_or(TaskState::Exited);
+    let passed = user_result.passed && state == TaskState::Exited && elf::selftest();
+
+    if passed {
+        serial::log("elf", "ELF64 user process passed");
+    } else {
+        serial::log("elf", "ELF64 user process failed");
+    }
+
+    TaskRunResult {
+        ran: user_result.ran,
+        passed,
+        task_id: task.id,
+        state,
+        entry_point: task.entry_point,
+        stack_top: task.stack_top,
+        exit_code: user_result.exit_code,
+        syscalls_before: user_result.syscalls_before,
+        syscalls_after: user_result.syscalls_after,
+    }
+}
+
 pub fn selftest() -> bool {
     let snapshot = snapshot();
 
@@ -421,6 +495,7 @@ pub fn selftest() -> bool {
         && user::probe_entry_point() != 0
         && user::probe_stack_top() != 0
         && user::probe_expected_exit_code() == 42
+        && elf::selftest()
 }
 
 pub fn state_name(state: TaskState) -> &'static str {

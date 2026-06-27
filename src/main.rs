@@ -7,6 +7,7 @@ use x86_64::instructions::interrupts as cpu_interrupts;
 
 mod buildinfo;
 mod ci;
+mod elf;
 mod gdt;
 mod heap;
 mod interrupts;
@@ -23,6 +24,7 @@ mod shell;
 mod stats;
 mod syscall;
 mod user;
+mod user_program;
 mod vga;
 
 core::arch::global_asm!(
@@ -70,7 +72,7 @@ _start:
 
     movl $0xC0000080, %ecx
     rdmsr
-    orl $0x100, %eax
+    orl $0x900, %eax
     wrmsr
 
     lgdt gdt_descriptor
@@ -189,6 +191,7 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info_addr: u32) ->
     let heap_state = heap::init();
     serial::log_u64("heap", "heap bytes", heap_state.size);
     user::init();
+    elf::init();
     process::init();
     scheduler::init();
     syscall::init();

@@ -1,12 +1,13 @@
 use crate::{
-    gdt, heap, interrupts, keyboard, klog, multiboot, paging, physmem, process, scheduler, serial,
-    shell, stats, syscall, user, vga,
+    elf, gdt, heap, interrupts, keyboard, klog, multiboot, paging, physmem, process, scheduler,
+    serial, shell, stats, syscall, user, user_program, vga,
 };
 use x86_64::instructions::hlt;
 
 const CI_BOOT_FLAG: &[u8] = b"tobacco.ci=smoke";
 const CI_SHELL_FLAG: &[u8] = b"tobacco.ci=shell";
 const CI_SYSCALL_FLAG: &[u8] = b"tobacco.ci=syscall";
+const CI_ELF_FLAG: &[u8] = b"tobacco.ci=elf";
 const CI_USER_FAULT_FLAG: &[u8] = b"tobacco.ci=userfault";
 const CI_HEAP_FLAG: &[u8] = b"tobacco.ci=heap";
 const CI_KEYBOARD_FLAG: &[u8] = b"tobacco.ci=keyboard";
@@ -38,6 +39,11 @@ pub fn run_if_requested() {
 
         if contains_bytes(command_line, CI_SYSCALL_FLAG) {
             run_syscall_probe_matrix();
+            return;
+        }
+
+        if contains_bytes(command_line, CI_ELF_FLAG) {
+            run_elf_loader_matrix();
             return;
         }
 
@@ -119,6 +125,17 @@ fn run_syscall_probe_matrix() {
     serial::log("ci", "syscall probe complete");
 }
 
+fn run_elf_loader_matrix() {
+    serial::log("ci", "ELF loader test requested");
+    if run_elf_loader_checks() {
+        serial::log("ci", "ELF loader status: PASS");
+    } else {
+        serial::log("ci", "ELF loader status: FAIL");
+    }
+
+    serial::log("ci", "ELF loader test complete");
+}
+
 fn run_user_fault_matrix() {
     serial::log("ci", "user page fault requested");
     if run_user_fault_isolation_checks() {
@@ -198,6 +215,8 @@ fn run_command_table_checks() {
     check("command heapcheck", shell::command_exists(b"heapcheck"));
     check("command vmtest", shell::command_exists(b"vmtest"));
     check("command user", shell::command_exists(b"user"));
+    check("command elf", shell::command_exists(b"elf"));
+    check("command elftest", shell::command_exists(b"elftest"));
     check("command process", shell::command_exists(b"process"));
     check("command tasks", shell::command_exists(b"tasks"));
     check("command sched", shell::command_exists(b"sched"));
@@ -231,6 +250,7 @@ fn run_selftest_checks() -> bool {
     let scheduler_state = scheduler::snapshot();
     let syscall_state = syscall::snapshot();
     let user_state = user::snapshot();
+    let elf_state = elf::snapshot();
     let interrupt_abi = interrupts::abi_snapshot();
 
     let mut ok = true;
@@ -341,6 +361,15 @@ fn run_selftest_checks() -> bool {
             && user_state.syscall_gate_ready,
     );
     ok &= check(
+        "selftest ELF64 loader",
+        elf_state.initialized
+            && elf_state.loaded
+            && elf_state.load_segments >= 1
+            && elf_state.executable_pages >= 1
+            && elf_state.writable_pages >= 1
+            && elf::selftest(),
+    );
+    ok &= check(
         "selftest process table ready",
         process_state.initialized && process_state.task_capacity == process::MAX_TASKS as u64,
     );
@@ -371,7 +400,7 @@ fn run_selftest_checks() -> bool {
         "selftest keyboard queue sane",
         keyboard::pending_events() < 256,
     );
-    ok &= check("selftest command table sane", shell::command_count() >= 47);
+    ok &= check("selftest command table sane", shell::command_count() >= 49);
 
     ok
 }
@@ -379,7 +408,78 @@ fn run_selftest_checks() -> bool {
 fn run_user_mode_checks() -> bool {
     let mut ok = true;
     ok &= run_syscall_probe_checks();
+    ok &= run_elf_loader_checks();
     ok &= run_user_fault_isolation_checks();
+    ok
+}
+
+fn run_elf_loader_checks() -> bool {
+    let loader = elf::snapshot();
+    let process_before = process::snapshot();
+    let result = process::run_elf_init_task();
+    let process_after = process::snapshot();
+    let text = paging::translate(loader.entry_point);
+    let data = paging::translate(paging::USER_ELF_BASE + paging::PAGE_SIZE_4K);
+    let stack = paging::translate(paging::USER_ELF_STACK_PAGE);
+    let mut ok = true;
+
+    ok &= check(
+        "ELF loader initialized",
+        loader.initialized && loader.loaded && loader.last_error.is_none(),
+    );
+    ok &= check(
+        "ELF header validated",
+        loader.entry_point >= loader.image_start
+            && loader.entry_point < loader.image_end
+            && loader.load_segments == 2,
+    );
+    ok &= check(
+        "ELF PT_LOAD mapped",
+        loader.mapped_pages == 3 && loader.executable_pages == 1 && loader.writable_pages == 2,
+    );
+    ok &= check(
+        "ELF W^X permissions",
+        text.mapped
+            && text.user_accessible
+            && text.executable
+            && !text.writable
+            && data.mapped
+            && data.user_accessible
+            && data.writable
+            && !data.executable
+            && stack.mapped
+            && stack.user_accessible
+            && stack.writable
+            && !stack.executable
+            && !paging::translate(paging::USER_ELF_STACK_GUARD).mapped,
+    );
+    ok &= check("ELF loader selftest", elf::selftest());
+    ok &= check("ELF process spawned", result.task_id > 0);
+    ok &= check(
+        "ELF process entered Ring 3",
+        result.ran && result.entry_point == loader.entry_point,
+    );
+    ok &= check(
+        "ELF process exited",
+        result.state == process::TaskState::Exited
+            && result.exit_code == user_program::INIT_EXPECTED_EXIT_CODE,
+    );
+    ok &= check(
+        "ELF process syscalls",
+        result.syscalls_after
+            >= result
+                .syscalls_before
+                .saturating_add(user_program::INIT_MINIMUM_SYSCALLS),
+    );
+    ok &= check("ELF process status", result.passed);
+    ok &= check(
+        "ELF process accounting",
+        process_after.spawned_tasks > process_before.spawned_tasks
+            && process_after.exited_total > process_before.exited_total
+            && process_after.last_task_id == result.task_id
+            && process_after.last_exit_code == result.exit_code,
+    );
+
     ok
 }
 
