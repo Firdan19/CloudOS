@@ -1,6 +1,6 @@
 use crate::{physmem, serial};
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use x86_64::instructions::interrupts as cpu_interrupts;
 
 pub const PAGE_SIZE_4K: u64 = 4096;
@@ -39,6 +39,8 @@ const USER_DATA_PAGE_FLAGS: u64 = DEFAULT_PAGE_FLAGS | ENTRY_USER | ENTRY_NO_EXE
 const ENTRY_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 const HUGE_ENTRY_ADDR_MASK: u64 = 0x000f_ffff_ffe0_0000;
 pub const MAX_TRACKED_MAPPINGS: usize = 128;
+pub const MAX_PROCESS_USER_PAGES: usize = 65;
+pub const MAX_PROCESS_TABLE_FRAMES: usize = 16;
 
 unsafe extern "C" {
     static boot_p4_table: u64;
@@ -173,6 +175,305 @@ pub struct PermissionAudit {
     pub test_pages: u64,
     pub guard_pages_intact: bool,
     pub tracking_consistent: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AddressSpaceError {
+    NotInitialized,
+    OutOfFrames,
+    PhysicalNotIdentityMapped,
+    TableCapacityExceeded,
+    PageCapacityExceeded,
+    VirtualUnaligned,
+    OutsideUserRange,
+    AlreadyMapped,
+    MissingPageTable,
+    ActiveAddressSpace,
+}
+
+#[derive(Clone, Copy)]
+pub struct AddressSpaceAudit {
+    pub valid_root: bool,
+    pub mapped_pages: u64,
+    pub user_pages: u64,
+    pub writable_pages: u64,
+    pub executable_pages: u64,
+    pub writable_executable_pages: u64,
+    pub stack_guard_intact: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct CleanupReport {
+    pub user_frames_freed: u64,
+    pub table_frames_freed: u64,
+    pub complete: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct AddressSpaceStats {
+    pub created: u64,
+    pub destroyed: u64,
+    pub active: u64,
+    pub user_frames_freed: u64,
+    pub table_frames_freed: u64,
+    pub cleanup_failures: u64,
+    pub last_created_root: u64,
+    pub last_destroyed_root: u64,
+}
+
+pub struct AddressSpace {
+    root_frame: u64,
+    table_frames: [u64; MAX_PROCESS_TABLE_FRAMES],
+    table_frame_count: usize,
+    user_frames: [u64; MAX_PROCESS_USER_PAGES],
+    user_virtuals: [u64; MAX_PROCESS_USER_PAGES],
+    user_permissions: [UserPagePermissions; MAX_PROCESS_USER_PAGES],
+    user_frame_count: usize,
+    active: bool,
+}
+
+impl AddressSpace {
+    pub const fn empty() -> Self {
+        Self {
+            root_frame: 0,
+            table_frames: [0; MAX_PROCESS_TABLE_FRAMES],
+            table_frame_count: 0,
+            user_frames: [0; MAX_PROCESS_USER_PAGES],
+            user_virtuals: [0; MAX_PROCESS_USER_PAGES],
+            user_permissions: [UserPagePermissions::READ_WRITE; MAX_PROCESS_USER_PAGES],
+            user_frame_count: 0,
+            active: false,
+        }
+    }
+
+    pub fn create() -> Result<Self, AddressSpaceError> {
+        if !PAGING_INITIALIZED.load(Ordering::Acquire) {
+            return Err(AddressSpaceError::NotInitialized);
+        }
+
+        cpu_interrupts::without_interrupts(|| {
+            let mut space = Self::empty();
+            let setup = (|| {
+                let root = space.allocate_table_frame()?;
+                space.root_frame = root;
+                let low_p3 = space.allocate_table_frame()?;
+                let user_p2 = space.allocate_table_frame()?;
+
+                let source_p4 = boot_p4();
+                let destination_p4 = table_from_frame_mut(root)?;
+                destination_p4.copy_from_slice(source_p4);
+
+                let source_low_p3 =
+                    table_from_entry(source_p4[0]).ok_or(AddressSpaceError::MissingPageTable)?;
+                let destination_low_p3 = table_from_frame_mut(low_p3)?;
+                destination_low_p3.copy_from_slice(source_low_p3);
+
+                destination_p4[0] = low_p3 | ENTRY_PRESENT | ENTRY_WRITABLE | ENTRY_USER;
+                let user_p3_index = ((USER_SPACE_BASE >> 30) & 0x1ff) as usize;
+                destination_low_p3[user_p3_index] =
+                    user_p2 | ENTRY_PRESENT | ENTRY_WRITABLE | ENTRY_USER;
+                Ok(())
+            })();
+
+            if let Err(error) = setup {
+                space.release_partial_tables();
+                return Err(error);
+            }
+
+            space.active = true;
+            ADDRESS_SPACES_CREATED.fetch_add(1, Ordering::Relaxed);
+            ACTIVE_ADDRESS_SPACES.fetch_add(1, Ordering::Relaxed);
+            LAST_CREATED_ROOT.store(space.root_frame, Ordering::Release);
+            Ok(space)
+        })
+    }
+
+    pub fn root_frame(&self) -> u64 {
+        self.root_frame
+    }
+
+    pub fn mapped_pages(&self) -> u64 {
+        self.user_frame_count as u64
+    }
+
+    pub fn table_frames(&self) -> u64 {
+        self.table_frame_count as u64
+    }
+
+    pub fn first_user_frame(&self) -> u64 {
+        self.user_frames.first().copied().unwrap_or(0)
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    pub fn map_user_page(
+        &mut self,
+        virt: u64,
+        permissions: UserPagePermissions,
+    ) -> Result<u64, AddressSpaceError> {
+        if !self.active || self.root_frame == 0 {
+            return Err(AddressSpaceError::NotInitialized);
+        }
+        if !is_page_aligned(virt) {
+            return Err(AddressSpaceError::VirtualUnaligned);
+        }
+        if !in_user_virtual_range(virt) {
+            return Err(AddressSpaceError::OutsideUserRange);
+        }
+        if self.user_frame_count >= MAX_PROCESS_USER_PAGES {
+            return Err(AddressSpaceError::PageCapacityExceeded);
+        }
+        if self.translate(virt).mapped {
+            return Err(AddressSpaceError::AlreadyMapped);
+        }
+
+        cpu_interrupts::without_interrupts(|| {
+            let p4 = table_from_frame_mut(self.root_frame)?;
+            let p4_index = ((virt >> 39) & 0x1ff) as usize;
+            let p3 =
+                table_from_entry_mut(p4[p4_index]).ok_or(AddressSpaceError::MissingPageTable)?;
+            let p3_index = ((virt >> 30) & 0x1ff) as usize;
+            let p2 =
+                table_from_entry_mut(p3[p3_index]).ok_or(AddressSpaceError::MissingPageTable)?;
+            let p2_index = ((virt >> 21) & 0x1ff) as usize;
+
+            if !entry_present(p2[p2_index]) {
+                let p1_frame = self.allocate_table_frame()?;
+                p2[p2_index] = p1_frame | ENTRY_PRESENT | ENTRY_WRITABLE | ENTRY_USER;
+            }
+            let p1 =
+                table_from_entry_mut(p2[p2_index]).ok_or(AddressSpaceError::MissingPageTable)?;
+            let p1_index = ((virt >> 12) & 0x1ff) as usize;
+            if entry_present(p1[p1_index]) {
+                return Err(AddressSpaceError::AlreadyMapped);
+            }
+
+            let frame = allocate_zeroed_frame()?;
+            p1[p1_index] = frame | permissions.flags();
+            self.user_frames[self.user_frame_count] = frame;
+            self.user_virtuals[self.user_frame_count] = virt;
+            self.user_permissions[self.user_frame_count] = permissions;
+            self.user_frame_count += 1;
+            Ok(frame)
+        })
+    }
+
+    pub fn translate(&self, virt: u64) -> TranslateResult {
+        if !self.active || self.root_frame == 0 {
+            return unmapped(virt);
+        }
+
+        translate_from_root(self.root_frame, virt)
+    }
+
+    pub fn audit(&self) -> AddressSpaceAudit {
+        let mut audit = AddressSpaceAudit {
+            valid_root: self.active && self.root_frame != 0,
+            mapped_pages: self.user_frame_count as u64,
+            user_pages: 0,
+            writable_pages: 0,
+            executable_pages: 0,
+            writable_executable_pages: 0,
+            stack_guard_intact: !self.translate(USER_ELF_STACK_GUARD).mapped,
+        };
+
+        for index in 0..self.user_frame_count {
+            let translation = self.translate(self.user_virtuals[index]);
+            let permissions = self.user_permissions[index];
+            if translation.mapped
+                && translation.phys == self.user_frames[index]
+                && translation.user_accessible
+                && translation.writable == permissions.writable
+                && translation.executable == permissions.executable
+            {
+                audit.user_pages = audit.user_pages.saturating_add(1);
+            }
+            if translation.writable {
+                audit.writable_pages = audit.writable_pages.saturating_add(1);
+            }
+            if translation.executable {
+                audit.executable_pages = audit.executable_pages.saturating_add(1);
+            }
+            if translation.writable && translation.executable {
+                audit.writable_executable_pages = audit.writable_executable_pages.saturating_add(1);
+            }
+        }
+
+        audit
+    }
+
+    pub fn destroy(&mut self) -> Result<CleanupReport, AddressSpaceError> {
+        if !self.active {
+            return Ok(CleanupReport {
+                user_frames_freed: 0,
+                table_frames_freed: 0,
+                complete: true,
+            });
+        }
+        if active_cr3() == self.root_frame {
+            return Err(AddressSpaceError::ActiveAddressSpace);
+        }
+
+        cpu_interrupts::without_interrupts(|| {
+            let root = self.root_frame;
+            let mut report = CleanupReport {
+                user_frames_freed: 0,
+                table_frames_freed: 0,
+                complete: true,
+            };
+
+            for index in 0..self.user_frame_count {
+                if physmem::free_frame(self.user_frames[index]) {
+                    report.user_frames_freed = report.user_frames_freed.saturating_add(1);
+                } else {
+                    report.complete = false;
+                }
+            }
+
+            let mut remaining = self.table_frame_count;
+            while remaining > 0 {
+                remaining -= 1;
+                if physmem::free_frame(self.table_frames[remaining]) {
+                    report.table_frames_freed = report.table_frames_freed.saturating_add(1);
+                } else {
+                    report.complete = false;
+                }
+            }
+
+            *self = Self::empty();
+            ADDRESS_SPACES_DESTROYED.fetch_add(1, Ordering::Relaxed);
+            ACTIVE_ADDRESS_SPACES.fetch_sub(1, Ordering::Relaxed);
+            USER_FRAMES_FREED.fetch_add(report.user_frames_freed, Ordering::Relaxed);
+            TABLE_FRAMES_FREED.fetch_add(report.table_frames_freed, Ordering::Relaxed);
+            LAST_DESTROYED_ROOT.store(root, Ordering::Release);
+            if !report.complete {
+                ADDRESS_SPACE_CLEANUP_FAILURES.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(report)
+        })
+    }
+
+    fn allocate_table_frame(&mut self) -> Result<u64, AddressSpaceError> {
+        if self.table_frame_count >= MAX_PROCESS_TABLE_FRAMES {
+            return Err(AddressSpaceError::TableCapacityExceeded);
+        }
+
+        let frame = allocate_zeroed_frame()?;
+        self.table_frames[self.table_frame_count] = frame;
+        self.table_frame_count += 1;
+        Ok(frame)
+    }
+
+    fn release_partial_tables(&mut self) {
+        let mut remaining = self.table_frame_count;
+        while remaining > 0 {
+            remaining -= 1;
+            let _ = physmem::free_frame(self.table_frames[remaining]);
+        }
+        *self = Self::empty();
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -322,6 +623,14 @@ struct MapperStore {
 unsafe impl Sync for MapperStore {}
 
 static PAGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static ADDRESS_SPACES_CREATED: AtomicU64 = AtomicU64::new(0);
+static ADDRESS_SPACES_DESTROYED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_ADDRESS_SPACES: AtomicU64 = AtomicU64::new(0);
+static USER_FRAMES_FREED: AtomicU64 = AtomicU64::new(0);
+static TABLE_FRAMES_FREED: AtomicU64 = AtomicU64::new(0);
+static ADDRESS_SPACE_CLEANUP_FAILURES: AtomicU64 = AtomicU64::new(0);
+static LAST_CREATED_ROOT: AtomicU64 = AtomicU64::new(0);
+static LAST_DESTROYED_ROOT: AtomicU64 = AtomicU64::new(0);
 static MAPPER_STATE: MapperStore = MapperStore {
     value: UnsafeCell::new(MapperState::new()),
 };
@@ -389,6 +698,23 @@ pub fn snapshot() -> Snapshot {
     }
 }
 
+pub fn address_space_stats() -> AddressSpaceStats {
+    AddressSpaceStats {
+        created: ADDRESS_SPACES_CREATED.load(Ordering::Acquire),
+        destroyed: ADDRESS_SPACES_DESTROYED.load(Ordering::Acquire),
+        active: ACTIVE_ADDRESS_SPACES.load(Ordering::Acquire),
+        user_frames_freed: USER_FRAMES_FREED.load(Ordering::Acquire),
+        table_frames_freed: TABLE_FRAMES_FREED.load(Ordering::Acquire),
+        cleanup_failures: ADDRESS_SPACE_CLEANUP_FAILURES.load(Ordering::Acquire),
+        last_created_root: LAST_CREATED_ROOT.load(Ordering::Acquire),
+        last_destroyed_root: LAST_DESTROYED_ROOT.load(Ordering::Acquire),
+    }
+}
+
+pub fn active_cr3() -> u64 {
+    read_cr3()
+}
+
 pub fn translate(virt: u64) -> TranslateResult {
     let p4 = boot_p4();
 
@@ -447,6 +773,83 @@ pub fn translate(virt: u64) -> TranslateResult {
         return unmapped(virt);
     };
 
+    let p1_entry = p1[p1_index];
+    if !entry_present(p1_entry) {
+        return unmapped(virt);
+    }
+    user_accessible &= entry_user(p1_entry);
+    writable &= entry_writable(p1_entry);
+    executable &= !entry_no_execute(p1_entry);
+
+    TranslateResult {
+        virt,
+        phys: entry_addr(p1_entry).saturating_add(virt & (PAGE_SIZE_4K - 1)),
+        mapped: true,
+        huge_page: false,
+        user_accessible,
+        writable,
+        executable,
+        page_size: PAGE_SIZE_4K,
+    }
+}
+
+fn translate_from_root(root_frame: u64, virt: u64) -> TranslateResult {
+    let Some(p4) = table_from_frame(root_frame) else {
+        return unmapped(virt);
+    };
+
+    let p4_index = ((virt >> 39) & 0x1ff) as usize;
+    let p3_index = ((virt >> 30) & 0x1ff) as usize;
+    let p2_index = ((virt >> 21) & 0x1ff) as usize;
+    let p1_index = ((virt >> 12) & 0x1ff) as usize;
+    let huge_offset = virt & (HUGE_PAGE_SIZE - 1);
+
+    let p4_entry = p4[p4_index];
+    if !entry_present(p4_entry) {
+        return unmapped(virt);
+    }
+    let mut user_accessible = entry_user(p4_entry);
+    let mut writable = entry_writable(p4_entry);
+    let mut executable = !entry_no_execute(p4_entry);
+
+    let Some(p3) = table_from_entry(p4_entry) else {
+        return unmapped(virt);
+    };
+    let p3_entry = p3[p3_index];
+    if !entry_present(p3_entry) {
+        return unmapped(virt);
+    }
+    user_accessible &= entry_user(p3_entry);
+    writable &= entry_writable(p3_entry);
+    executable &= !entry_no_execute(p3_entry);
+
+    let Some(p2) = table_from_entry(p3_entry) else {
+        return unmapped(virt);
+    };
+    let p2_entry = p2[p2_index];
+    if !entry_present(p2_entry) {
+        return unmapped(virt);
+    }
+    user_accessible &= entry_user(p2_entry);
+    writable &= entry_writable(p2_entry);
+    executable &= !entry_no_execute(p2_entry);
+
+    if entry_huge(p2_entry) {
+        return TranslateResult {
+            virt,
+            phys: huge_entry_addr(p2_entry).saturating_add(huge_offset),
+            mapped: true,
+            huge_page: true,
+            user_accessible,
+            writable,
+            executable,
+            page_size: HUGE_PAGE_SIZE,
+        };
+    }
+
+    let Some(p1) = table_from_entry(p2_entry) else {
+        return unmapped(virt);
+    };
     let p1_entry = p1[p1_index];
     if !entry_present(p1_entry) {
         return unmapped(virt);
@@ -621,6 +1024,23 @@ pub fn unmap_error_name(error: UnmapError) -> &'static str {
         UnmapError::NotMapped => "virtual page is not mapped",
         UnmapError::HugePageConflict => "mapping conflicts with a huge page",
         UnmapError::PageTableNotReachable => "page table is not identity reachable",
+    }
+}
+
+pub fn address_space_error_name(error: AddressSpaceError) -> &'static str {
+    match error {
+        AddressSpaceError::NotInitialized => "address space is not initialized",
+        AddressSpaceError::OutOfFrames => "address space frame allocation failed",
+        AddressSpaceError::PhysicalNotIdentityMapped => {
+            "address space frame is not identity reachable"
+        }
+        AddressSpaceError::TableCapacityExceeded => "address space page-table capacity exceeded",
+        AddressSpaceError::PageCapacityExceeded => "address space user-page capacity exceeded",
+        AddressSpaceError::VirtualUnaligned => "address space virtual page is unaligned",
+        AddressSpaceError::OutsideUserRange => "address space page is outside user range",
+        AddressSpaceError::AlreadyMapped => "address space page is already mapped",
+        AddressSpaceError::MissingPageTable => "address space page table is missing",
+        AddressSpaceError::ActiveAddressSpace => "cannot destroy the active address space",
     }
 }
 
@@ -889,6 +1309,24 @@ fn table_from_entry(entry: u64) -> Option<&'static [u64; PAGE_TABLE_ENTRIES]> {
     Some(unsafe { &*(address as *const [u64; PAGE_TABLE_ENTRIES]) })
 }
 
+fn table_from_frame(frame: u64) -> Option<&'static [u64; PAGE_TABLE_ENTRIES]> {
+    if !identity_reachable(frame) || !is_page_aligned(frame) {
+        return None;
+    }
+
+    Some(unsafe { &*(frame as *const [u64; PAGE_TABLE_ENTRIES]) })
+}
+
+fn table_from_frame_mut(
+    frame: u64,
+) -> Result<&'static mut [u64; PAGE_TABLE_ENTRIES], AddressSpaceError> {
+    if !identity_reachable(frame) || !is_page_aligned(frame) {
+        return Err(AddressSpaceError::PhysicalNotIdentityMapped);
+    }
+
+    Ok(unsafe { &mut *(frame as *mut [u64; PAGE_TABLE_ENTRIES]) })
+}
+
 fn table_from_entry_mut(entry: u64) -> Option<&'static mut [u64; PAGE_TABLE_ENTRIES]> {
     let address = entry_addr(entry);
 
@@ -903,6 +1341,17 @@ fn zero_frame(phys: u64) {
     unsafe {
         core::ptr::write_bytes(phys as *mut u8, 0, PAGE_SIZE_4K as usize);
     }
+}
+
+fn allocate_zeroed_frame() -> Result<u64, AddressSpaceError> {
+    let frame = physmem::allocate_frame().ok_or(AddressSpaceError::OutOfFrames)?;
+    if !identity_reachable(frame) {
+        let _ = physmem::free_frame(frame);
+        return Err(AddressSpaceError::PhysicalNotIdentityMapped);
+    }
+
+    zero_frame(frame);
+    Ok(frame)
 }
 
 fn in_managed_virtual_range(virt: u64) -> bool {

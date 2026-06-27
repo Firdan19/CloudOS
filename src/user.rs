@@ -96,7 +96,13 @@ static mut USER_STACK_PAGE: Page = Page {
 };
 
 unsafe extern "C" {
-    fn user_enter(entry: u64, stack_top: u64, data_selector: u64, code_selector: u64) -> u64;
+    fn user_enter(
+        entry: u64,
+        stack_top: u64,
+        data_selector: u64,
+        code_selector: u64,
+        address_space_root: u64,
+    ) -> u64;
     fn user_return_to_kernel(exit_code: u64) -> !;
 }
 
@@ -171,6 +177,22 @@ pub fn run_program(
     expected_exit_code: u64,
     minimum_syscalls: u64,
 ) -> ProbeResult {
+    run_program_in_address_space(
+        entry_point,
+        stack_top,
+        expected_exit_code,
+        minimum_syscalls,
+        paging::active_cr3(),
+    )
+}
+
+pub fn run_program_in_address_space(
+    entry_point: u64,
+    stack_top: u64,
+    expected_exit_code: u64,
+    minimum_syscalls: u64,
+    address_space_root: u64,
+) -> ProbeResult {
     let before = USER_SYSCALLS.load(Ordering::Acquire);
 
     if !USER_READY.load(Ordering::Acquire) || !interrupts::syscall_gate_ready() {
@@ -193,6 +215,7 @@ pub fn run_program(
             stack_top,
             gdt::USER_DATA_SELECTOR as u64,
             gdt::USER_CODE_SELECTOR as u64,
+            address_space_root,
         )
     };
     cpu_interrupts::enable();

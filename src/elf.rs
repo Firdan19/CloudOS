@@ -44,6 +44,7 @@ pub enum LoadError {
     TargetPageAlreadyMapped,
     PageMappingFailed(paging::MapError),
     StackMappingFailed(paging::MapError),
+    AddressSpaceFailed(paging::AddressSpaceError),
     MappingLost,
 }
 
@@ -57,6 +58,15 @@ pub struct LoadedImage {
     pub mapped_pages: u64,
     pub writable_pages: u64,
     pub executable_pages: u64,
+}
+
+pub struct ProcessImage {
+    pub address_space: paging::AddressSpace,
+    pub entry_point: u64,
+    pub stack_top: u64,
+    pub mapped_pages: u64,
+    pub table_frames: u64,
+    pub first_user_frame: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -215,6 +225,62 @@ pub fn loaded_image() -> Option<LoadedImage> {
     cpu_interrupts::without_interrupts(|| loader_state().loaded)
 }
 
+pub fn create_process_image() -> Result<ProcessImage, LoadError> {
+    let file = initramfs::find("/bin/init").ok_or(LoadError::InitProgramMissing)?;
+    let plan = validate_image(file.data)?;
+    let mut address_space =
+        paging::AddressSpace::create().map_err(LoadError::AddressSpaceFailed)?;
+
+    let setup = (|| {
+        for segment_index in 0..plan.segment_count {
+            let segment = plan.segments[segment_index];
+            let mut page = segment.page_start();
+            while page < segment.page_end() {
+                address_space
+                    .map_user_page(page, segment.permissions())
+                    .map_err(LoadError::AddressSpaceFailed)?;
+                page += paging::PAGE_SIZE_4K;
+            }
+        }
+
+        address_space
+            .map_user_page(
+                paging::USER_ELF_STACK_PAGE,
+                paging::UserPagePermissions::READ_WRITE,
+            )
+            .map_err(LoadError::AddressSpaceFailed)?;
+
+        for segment_index in 0..plan.segment_count {
+            copy_segment_to_address_space(file.data, plan.segments[segment_index], &address_space)?;
+        }
+
+        let audit = address_space.audit();
+        if !audit.valid_root
+            || audit.user_pages != address_space.mapped_pages()
+            || audit.writable_executable_pages != 0
+            || !audit.stack_guard_intact
+        {
+            return Err(LoadError::MappingLost);
+        }
+
+        Ok(())
+    })();
+
+    if let Err(error) = setup {
+        let _ = address_space.destroy();
+        return Err(error);
+    }
+
+    Ok(ProcessImage {
+        entry_point: plan.entry_point,
+        stack_top: paging::USER_ELF_STACK_TOP,
+        mapped_pages: address_space.mapped_pages(),
+        table_frames: address_space.table_frames(),
+        first_user_frame: address_space.first_user_frame(),
+        address_space,
+    })
+}
+
 pub fn selftest() -> bool {
     const INVALID_IMAGE: [u8; ELF_HEADER_SIZE] = [0; ELF_HEADER_SIZE];
 
@@ -294,6 +360,7 @@ pub fn load_error_name(error: LoadError) -> &'static str {
         LoadError::TargetPageAlreadyMapped => "ELF target page is already mapped",
         LoadError::PageMappingFailed(error) => paging::map_error_name(error),
         LoadError::StackMappingFailed(error) => paging::map_error_name(error),
+        LoadError::AddressSpaceFailed(error) => paging::address_space_error_name(error),
         LoadError::MappingLost => "ELF mapping disappeared during load",
     }
 }
@@ -540,6 +607,37 @@ fn copy_segment(image: &[u8], segment: SegmentPlan) -> Result<(), LoadError> {
     while copied < segment.file_size {
         let virtual_address = segment.virtual_address + copied;
         let translation = paging::translate(virtual_address);
+        if !translation.mapped || !translation.user_accessible {
+            return Err(LoadError::MappingLost);
+        }
+
+        let page_offset = virtual_address & (paging::PAGE_SIZE_4K - 1);
+        let available = paging::PAGE_SIZE_4K - page_offset;
+        let chunk = available.min(segment.file_size - copied);
+        let source_offset = (segment.file_offset + copied) as usize;
+
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                image.as_ptr().add(source_offset),
+                translation.phys as *mut u8,
+                chunk as usize,
+            );
+        }
+        copied += chunk;
+    }
+
+    Ok(())
+}
+
+fn copy_segment_to_address_space(
+    image: &[u8],
+    segment: SegmentPlan,
+    address_space: &paging::AddressSpace,
+) -> Result<(), LoadError> {
+    let mut copied = 0u64;
+    while copied < segment.file_size {
+        let virtual_address = segment.virtual_address + copied;
+        let translation = address_space.translate(virtual_address);
         if !translation.mapped || !translation.user_accessible {
             return Err(LoadError::MappingLost);
         }

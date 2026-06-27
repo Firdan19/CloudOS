@@ -217,8 +217,14 @@ fn run_command_table_checks() {
     check("command user", shell::command_exists(b"user"));
     check("command elf", shell::command_exists(b"elf"));
     check("command elftest", shell::command_exists(b"elftest"));
+    check("command spawn", shell::command_exists(b"spawn"));
     check("command initramfs", shell::command_exists(b"initramfs"));
     check("command process", shell::command_exists(b"process"));
+    check("command lifecycle", shell::command_exists(b"lifecycle"));
+    check(
+        "command lifecycletest",
+        shell::command_exists(b"lifecycletest"),
+    );
     check("command tasks", shell::command_exists(b"tasks"));
     check("command sched", shell::command_exists(b"sched"));
     check("command usertest", shell::command_exists(b"usertest"));
@@ -248,6 +254,7 @@ fn run_selftest_checks() -> bool {
     let counters = stats::snapshot();
     let ticks = interrupts::ticks();
     let process_state = process::snapshot();
+    let address_spaces = paging::address_space_stats();
     let scheduler_state = scheduler::snapshot();
     let syscall_state = syscall::snapshot();
     let user_state = user::snapshot();
@@ -388,6 +395,13 @@ fn run_selftest_checks() -> bool {
     );
     ok &= check("selftest process model", process::selftest());
     ok &= check(
+        "selftest process resource lifecycle",
+        process_state.active_resources == 0
+            && process_state.cleanup_failures == 0
+            && address_spaces.active == 0
+            && address_spaces.cleanup_failures == 0,
+    );
+    ok &= check(
         "selftest scheduler ready",
         scheduler_state.initialized
             && scheduler_state.queue_capacity == scheduler::QUEUE_CAPACITY as u64
@@ -413,7 +427,7 @@ fn run_selftest_checks() -> bool {
         "selftest keyboard queue sane",
         keyboard::pending_events() < 256,
     );
-    ok &= check("selftest command table sane", shell::command_count() >= 50);
+    ok &= check("selftest command table sane", shell::command_count() >= 53);
 
     ok
 }
@@ -430,8 +444,14 @@ fn run_elf_loader_checks() -> bool {
     let loader = elf::snapshot();
     let archive = initramfs::snapshot();
     let process_before = process::snapshot();
+    let frames_before = physmem::snapshot();
+    let heap_before = heap::snapshot();
+    let spaces_before = paging::address_space_stats().active;
     let result = process::run_elf_init_task();
     let process_after = process::snapshot();
+    let frames_after = physmem::snapshot();
+    let heap_after = heap::snapshot();
+    let spaces_after = paging::address_space_stats().active;
     let text = paging::translate(loader.entry_point);
     let data = paging::translate(paging::USER_ELF_BASE + paging::PAGE_SIZE_4K);
     let stack = paging::translate(paging::USER_ELF_STACK_PAGE);
@@ -500,12 +520,59 @@ fn run_elf_loader_checks() -> bool {
     );
     ok &= check("ELF process status", result.passed);
     ok &= check(
+        "ELF process private address space",
+        result.address_space_root != 0
+            && result.first_user_frame != 0
+            && result.owned_user_pages >= 2
+            && result.owned_table_frames >= 3,
+    );
+    ok &= check(
+        "ELF process resource cleanup",
+        result.resources_cleaned
+            && result.heap_released
+            && result.cleanup_user_frames == result.owned_user_pages
+            && result.cleanup_table_frames == result.owned_table_frames,
+    );
+    ok &= check(
+        "ELF process resource baseline",
+        frames_after.allocated_frames == frames_before.allocated_frames
+            && frames_after.free_frames == frames_before.free_frames
+            && heap_after.active_allocations == heap_before.active_allocations
+            && heap_after.allocated_bytes == heap_before.allocated_bytes
+            && heap_after.free_bytes == heap_before.free_bytes
+            && heap_after.metadata_ok
+            && heap_after.sentinel_ok
+            && heap_after.allocation_canaries_ok
+            && spaces_after == spaces_before
+            && process_after.active_resources == process_before.active_resources,
+    );
+    ok &= check(
         "ELF process accounting",
         process_after.spawned_tasks > process_before.spawned_tasks
             && process_after.exited_total > process_before.exited_total
             && process_after.last_task_id == result.task_id
             && process_after.last_exit_code == result.exit_code,
     );
+
+    let isolation = process::run_isolation_test();
+    ok &= check("lifecycle two processes spawned", isolation.spawned);
+    ok &= check("lifecycle distinct CR3", isolation.distinct_roots);
+    ok &= check(
+        "lifecycle distinct user frames",
+        isolation.distinct_user_frames,
+    );
+    ok &= check(
+        "lifecycle first process cleaned",
+        isolation.first.resources_cleaned,
+    );
+    ok &= check(
+        "lifecycle second process cleaned",
+        isolation.second.resources_cleaned,
+    );
+    ok &= check("lifecycle frame baseline", isolation.frames_restored);
+    ok &= check("lifecycle heap baseline", isolation.heap_restored);
+    ok &= check("lifecycle resource baseline", isolation.resources_restored);
+    ok &= check("lifecycle status", isolation.passed);
 
     ok
 }

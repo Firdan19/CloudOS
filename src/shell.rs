@@ -20,7 +20,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 50] = [
+const COMMANDS: [Command; 53] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -162,9 +162,24 @@ const COMMANDS: [Command; 50] = [
         handler: command_elftest,
     },
     Command {
+        name: "spawn",
+        description: "spawn dan jalankan /bin/init",
+        handler: command_elftest,
+    },
+    Command {
         name: "process",
         description: "status task dan process model",
         handler: command_process,
+    },
+    Command {
+        name: "lifecycle",
+        description: "status resource lifecycle process",
+        handler: command_lifecycle,
+    },
+    Command {
+        name: "lifecycletest",
+        description: "uji isolasi dan cleanup dua process",
+        handler: command_lifecycletest,
     },
     Command {
         name: "tasks",
@@ -823,6 +838,7 @@ fn command_diag(_arguments: &[u8]) {
     let gdt_state = gdt::snapshot();
     let panic = paniclog::snapshot();
     let process_state = process::snapshot();
+    let address_spaces = paging::address_space_stats();
     let scheduler_state = scheduler::snapshot();
     let syscall_state = syscall::snapshot();
     let user_state = user::snapshot();
@@ -869,6 +885,10 @@ fn command_diag(_arguments: &[u8]) {
     print_counter("syscall unknown", syscall_state.unknown_syscalls);
     print_counter("tasks spawned", process_state.spawned_tasks);
     print_counter("tasks exited", process_state.exited_total);
+    print_counter("process resources", process_state.active_resources);
+    print_counter("process cleanup fail", process_state.cleanup_failures);
+    print_counter("address spaces", address_spaces.active);
+    print_counter("space cleanup fail", address_spaces.cleanup_failures);
     print_counter("ctx switches", scheduler_state.context_switches);
     print_counter("task ticks", scheduler_state.accounted_ticks);
     print("  user mode    : ");
@@ -976,6 +996,7 @@ fn print_health_report() -> u64 {
     let ticks = interrupts::ticks();
     let panic = paniclog::snapshot();
     let process_state = process::snapshot();
+    let address_spaces = paging::address_space_stats();
     let scheduler_state = scheduler::snapshot();
     let syscall_state = syscall::snapshot();
     let user_state = user::snapshot();
@@ -1067,7 +1088,16 @@ fn print_health_report() -> u64 {
     );
     health_line(
         "process model",
-        process_state.initialized && process_state.running_tasks == 0 && process::selftest(),
+        process_state.initialized
+            && process_state.running_tasks == 0
+            && process_state.active_resources == 0
+            && process_state.cleanup_failures == 0
+            && process::selftest(),
+        &mut issues,
+    );
+    health_line(
+        "address spaces",
+        address_spaces.active == 0 && address_spaces.cleanup_failures == 0,
         &mut issues,
     );
     health_line(
@@ -1096,7 +1126,7 @@ fn print_health_report() -> u64 {
         keyboard::pending_events() < 256,
         &mut issues,
     );
-    health_line("command table", COMMANDS.len() >= 50, &mut issues);
+    health_line("command table", COMMANDS.len() >= 53, &mut issues);
     health_line("last panic", !panic.present, &mut issues);
 
     issues
@@ -1114,6 +1144,7 @@ fn health_issue_count() -> u64 {
     let ticks = interrupts::ticks();
     let panic = paniclog::snapshot();
     let process_state = process::snapshot();
+    let address_spaces = paging::address_space_stats();
     let scheduler_state = scheduler::snapshot();
     let syscall_state = syscall::snapshot();
     let user_state = user::snapshot();
@@ -1188,7 +1219,15 @@ fn health_issue_count() -> u64 {
         &mut issues,
     );
     count_issue(
-        process_state.initialized && process_state.running_tasks == 0 && process::selftest(),
+        process_state.initialized
+            && process_state.running_tasks == 0
+            && process_state.active_resources == 0
+            && process_state.cleanup_failures == 0
+            && process::selftest(),
+        &mut issues,
+    );
+    count_issue(
+        address_spaces.active == 0 && address_spaces.cleanup_failures == 0,
         &mut issues,
     );
     count_issue(
@@ -1206,7 +1245,7 @@ fn health_issue_count() -> u64 {
     );
     count_issue(ticks >= counters.shell_ready_tick, &mut issues);
     count_issue(keyboard::pending_events() < 256, &mut issues);
-    count_issue(COMMANDS.len() >= 50, &mut issues);
+    count_issue(COMMANDS.len() >= 53, &mut issues);
     count_issue(!panic.present, &mut issues);
 
     issues
@@ -1809,10 +1848,18 @@ fn command_elftest(_arguments: &[u8]) {
     print("  stack top        : ");
     print_hex_u64(result.stack_top);
     newline();
+    print("  private CR3      : ");
+    print_hex_u64(result.address_space_root);
+    newline();
+    print_counter("user pages", result.owned_user_pages);
+    print_counter("table frames", result.owned_table_frames);
     print_counter("exit code", result.exit_code);
     print_counter("expected exit", user_program::INIT_EXPECTED_EXIT_CODE);
     print_counter("syscalls before", result.syscalls_before);
     print_counter("syscalls after", result.syscalls_after);
+    print("  resources cleaned: ");
+    print_on_off(result.resources_cleaned && result.heap_released);
+    newline();
     print("  status           : ");
 
     if result.passed {
@@ -1888,6 +1935,7 @@ fn command_faulttest(_arguments: &[u8]) {
 fn command_process(_arguments: &[u8]) {
     let snapshot = process::snapshot();
     let scheduler_snapshot = scheduler::snapshot();
+    let address_spaces = paging::address_space_stats();
 
     println("Process model:");
     print("  initialized      : ");
@@ -1902,6 +1950,13 @@ fn command_process(_arguments: &[u8]) {
     print_counter("spawned total", snapshot.spawned_tasks);
     print_counter("exited total", snapshot.exited_total);
     print_counter("failed spawns", snapshot.failed_spawns);
+    print_counter("active resources", snapshot.active_resources);
+    print_counter("cleanup success", snapshot.cleanup_successes);
+    print_counter("cleanup failure", snapshot.cleanup_failures);
+    print_counter("user frames freed", snapshot.reclaimed_user_frames);
+    print_counter("table frames freed", snapshot.reclaimed_table_frames);
+    print_counter("heap releases", snapshot.heap_releases);
+    print_counter("address spaces", address_spaces.active);
     print_counter("last task", snapshot.last_task_id);
     print_counter("last exit", snapshot.last_exit_code);
     print_counter("ctx switches", scheduler_snapshot.context_switches);
@@ -1909,6 +1964,77 @@ fn command_process(_arguments: &[u8]) {
     print_counter("task ticks", scheduler_snapshot.accounted_ticks);
 
     print_task_rows();
+}
+
+fn command_lifecycle(_arguments: &[u8]) {
+    let processes = process::snapshot();
+    let address_spaces = paging::address_space_stats();
+    let heap_state = heap::snapshot();
+
+    serial::log("process", "lifecycle status requested");
+    println("Process lifecycle:");
+    print_counter("spawned", processes.spawned_tasks);
+    print_counter("exited", processes.exited_total);
+    print_counter("active resources", processes.active_resources);
+    print_counter("cleanup success", processes.cleanup_successes);
+    print_counter("cleanup failure", processes.cleanup_failures);
+    print_counter("user frames freed", processes.reclaimed_user_frames);
+    print_counter("table frames freed", processes.reclaimed_table_frames);
+    print_counter("heap releases", processes.heap_releases);
+    print_counter("spaces created", address_spaces.created);
+    print_counter("spaces destroyed", address_spaces.destroyed);
+    print_counter("spaces active", address_spaces.active);
+    print_counter("space failures", address_spaces.cleanup_failures);
+    print_counter("heap allocations", heap_state.active_allocations);
+    print("  status           : ");
+    if processes.active_resources == 0
+        && processes.cleanup_failures == 0
+        && address_spaces.active == 0
+        && address_spaces.cleanup_failures == 0
+    {
+        println("CLEAN");
+    } else {
+        println("BUSY/WARN");
+    }
+}
+
+fn command_lifecycletest(_arguments: &[u8]) {
+    println("Process lifecycle isolation test:");
+    let report = process::run_isolation_test();
+
+    print("  two processes    : ");
+    print_on_off(report.spawned);
+    newline();
+    print("  private CR3      : ");
+    print_on_off(report.distinct_roots);
+    newline();
+    print("  private frames   : ");
+    print_on_off(report.distinct_user_frames);
+    newline();
+    print("  first cleanup    : ");
+    print_on_off(report.first.resources_cleaned);
+    newline();
+    print("  second cleanup   : ");
+    print_on_off(report.second.resources_cleaned);
+    newline();
+    print("  frame baseline   : ");
+    print_on_off(report.frames_restored);
+    newline();
+    print("  heap baseline    : ");
+    print_on_off(report.heap_restored);
+    newline();
+    print("  resource baseline: ");
+    print_on_off(report.resources_restored);
+    newline();
+    print("  status           : ");
+    if report.passed {
+        serial::log("process", "lifecycle isolation test passed");
+        println("PASS");
+    } else {
+        serial::log("process", "lifecycle isolation test failed");
+        stats::inc_shell_error();
+        println("FAIL");
+    }
 }
 
 fn command_tasks(_arguments: &[u8]) {
@@ -1939,12 +2065,18 @@ fn print_task_rows() {
             print_hex_u64(task.entry_point);
             print(" stack=");
             print_hex_u64(task.stack_top);
+            print(" cr3=");
+            print_hex_u64(task.address_space_root);
+            print(" pages=");
+            print_u64(task.owned_user_pages);
             print(" runs=");
             print_u64(task.runs);
             print(" exit=");
             print_u64(task.exit_code);
             print(" syscalls=");
             print_u64(task.syscalls_after.saturating_sub(task.syscalls_before));
+            print(" clean=");
+            print_on_off(task.cleanup_complete);
             newline();
         }
     }
@@ -2337,6 +2469,7 @@ fn command_selftest(_arguments: &[u8]) {
     let counters = stats::snapshot();
     let ticks = interrupts::ticks();
     let process_state = process::snapshot();
+    let address_spaces = paging::address_space_stats();
     let scheduler_state = scheduler::snapshot();
     let syscall_state = syscall::snapshot();
     let user_state = user::snapshot();
@@ -2533,6 +2666,15 @@ fn command_selftest(_arguments: &[u8]) {
         &mut failed,
     );
     selftest_check(
+        "process resource lifecycle",
+        process_state.active_resources == 0
+            && process_state.cleanup_failures == 0
+            && address_spaces.active == 0
+            && address_spaces.cleanup_failures == 0,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
         "scheduler ready",
         scheduler_state.initialized
             && scheduler_state.queue_capacity == scheduler::QUEUE_CAPACITY as u64
@@ -2590,7 +2732,7 @@ fn command_selftest(_arguments: &[u8]) {
     );
     selftest_check(
         "command table sane",
-        COMMANDS.len() >= 50,
+        COMMANDS.len() >= 53,
         &mut passed,
         &mut failed,
     );

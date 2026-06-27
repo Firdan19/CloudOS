@@ -50,6 +50,11 @@ Belum masuk ke GUI, filesystem besar, user space kompleks, plugin, atau AI servi
 - Initramfs read-only format CPIO `newc`
 - `/bin/init` dimuat sebagai Multiboot2 module
 - `/bin/init` dijalankan otomatis di Ring 3
+- Process lifecycle `spawn`, `yield`, dan `exit`
+- Address space privat per process dengan CR3 terpisah
+- Isolasi frame user antar process
+- Cleanup page table, user frame, dan heap saat process exit
+- Lifecycle isolation selftest untuk dua process
 - User page mapping terbatas
 - Syscall gate `int 0x80`
 - Minimal syscall ABI
@@ -106,7 +111,13 @@ Belum masuk ke GUI, filesystem besar, user space kompleks, plugin, atau AI servi
 - `user`
 - `elf`
 - `elftest`
+- `spawn`
 - `initramfs`
+- `process`
+- `tasks`
+- `lifecycle`
+- `lifecycletest`
+- `sched`
 - `usertest`
 - `syscall`
 - `gdt`
@@ -161,11 +172,11 @@ Tobacco tetap berada di Phase 1 sampai fondasi kernel benar-benar kokoh
 Target berikutnya
 
 - Syscall ABI lanjutan
-- Process Control Block
-- Scheduler awal
 - Memory isolation lebih matang
-- Process address space terpisah
 - Lifecycle `/bin/init` jangka panjang
+- Preemptive context switch
+- Process parent dan child
+- Wait dan process reaping
 - IPC dasar
 - Fault isolation untuk user process
 - CI test untuk user mode dan syscall

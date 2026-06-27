@@ -234,8 +234,15 @@ user_enter:
     push r14
     push r15
     mov [rel user_return_rsp], rsp
+    mov rax, cr3
+    mov [rel user_kernel_cr3], rax
     lea rax, [rel .return_from_user]
     mov [rel user_return_rip], rax
+
+    test r8, r8
+    jz .address_space_ready
+    mov cr3, r8
+.address_space_ready:
 
     mov ax, dx
     mov ds, ax
@@ -254,6 +261,8 @@ user_enter:
     iretq
 
 .return_from_user:
+    mov rdx, [rel user_kernel_cr3]
+    mov cr3, rdx
     mov ax, 0x10
     mov ds, ax
     mov es, ax
@@ -271,6 +280,8 @@ user_enter:
 
 user_return_to_kernel:
     mov [rel user_exit_code], rdi
+    mov rax, [rel user_kernel_cr3]
+    mov cr3, rax
     mov rsp, [rel user_return_rsp]
     jmp [rel user_return_rip]
 
@@ -281,4 +292,6 @@ user_return_rsp:
 user_return_rip:
     resq 1
 user_exit_code:
+    resq 1
+user_kernel_cr3:
     resq 1
