@@ -6,10 +6,12 @@ const MAX_BOOT_INFO_ADDRESS: u64 = 1024 * 1024 * 1024;
 const MAX_BOOT_INFO_SIZE: u32 = 1024 * 1024;
 const MAX_TEXT_LEN: usize = 96;
 const MAX_REGIONS: usize = 16;
+const MAX_MODULES: usize = 4;
 
 const TAG_END: u32 = 0;
 const TAG_COMMAND_LINE: u32 = 1;
 const TAG_BOOTLOADER_NAME: u32 = 2;
+const TAG_MODULE: u32 = 3;
 const TAG_BASIC_MEMORY: u32 = 4;
 const TAG_MEMORY_MAP: u32 = 6;
 
@@ -62,6 +64,34 @@ pub struct MemoryRegion {
     pub base_addr: u64,
     pub length: u64,
     pub region_type: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct BootModule {
+    pub start: u64,
+    pub end: u64,
+    pub command_line: TextField,
+}
+
+impl BootModule {
+    pub const fn empty() -> Self {
+        Self {
+            start: 0,
+            end: 0,
+            command_line: TextField::empty(),
+        }
+    }
+
+    pub fn size(&self) -> u64 {
+        self.end.saturating_sub(self.start)
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.start != 0
+            && self.end > self.start
+            && self.end <= MAX_BOOT_INFO_ADDRESS
+            && self.size() <= MAX_BOOT_INFO_ADDRESS
+    }
 }
 
 impl MemoryRegion {
@@ -203,6 +233,10 @@ pub struct BootInfoSummary {
     pub has_end_tag: bool,
     pub bootloader_name: TextField,
     pub command_line: TextField,
+    pub module_count: u32,
+    pub stored_module_count: u32,
+    pub highest_module_end: u64,
+    pub modules: [BootModule; MAX_MODULES],
     pub memory: MemorySummary,
 }
 
@@ -219,7 +253,26 @@ impl BootInfoSummary {
             has_end_tag: false,
             bootloader_name: TextField::empty(),
             command_line: TextField::empty(),
+            module_count: 0,
+            stored_module_count: 0,
+            highest_module_end: 0,
+            modules: [BootModule::empty(); MAX_MODULES],
             memory: MemorySummary::empty(),
+        }
+    }
+
+    fn add_module(&mut self, module: BootModule) {
+        if !module.is_valid() {
+            return;
+        }
+
+        self.module_count = self.module_count.saturating_add(1);
+        self.highest_module_end = self.highest_module_end.max(module.end);
+
+        let index = self.stored_module_count as usize;
+        if index < MAX_MODULES {
+            self.modules[index] = module;
+            self.stored_module_count = self.stored_module_count.saturating_add(1);
         }
     }
 }
@@ -262,6 +315,31 @@ pub fn stored_region_count() -> usize {
     summary().memory.stored_region_count as usize
 }
 
+pub fn boot_module(index: usize) -> Option<BootModule> {
+    let summary = summary();
+    if index >= summary.stored_module_count as usize {
+        return None;
+    }
+
+    Some(summary.modules[index])
+}
+
+pub fn find_module(command_line: &str) -> Option<BootModule> {
+    let summary = summary();
+    for index in 0..summary.stored_module_count as usize {
+        let module = summary.modules[index];
+        if module.command_line.as_str() == command_line {
+            return Some(module);
+        }
+    }
+
+    None
+}
+
+pub fn highest_module_end() -> u64 {
+    summary().highest_module_end
+}
+
 unsafe fn parse(magic: u32, address: u64) -> BootInfoSummary {
     let mut summary = BootInfoSummary::empty();
     summary.magic = magic;
@@ -298,6 +376,11 @@ unsafe fn parse(magic: u32, address: u64) -> BootInfoSummary {
             break;
         }
 
+        let tag_end = offset.saturating_add(tag_size as usize);
+        if tag_end > total_size || tag_end < offset {
+            break;
+        }
+
         summary.tag_count += 1;
 
         match tag_type {
@@ -314,6 +397,9 @@ unsafe fn parse(magic: u32, address: u64) -> BootInfoSummary {
                 summary
                     .bootloader_name
                     .set_from_c_string(tag_address + 8, tag_size as usize - 8);
+            }
+            TAG_MODULE => {
+                parse_module(&mut summary, tag_address, tag_size);
             }
             TAG_BASIC_MEMORY => {
                 parse_basic_memory(&mut summary, tag_address, tag_size);
@@ -333,6 +419,25 @@ unsafe fn parse(magic: u32, address: u64) -> BootInfoSummary {
 
     summary.parsed = summary.has_end_tag;
     summary
+}
+
+fn parse_module(summary: &mut BootInfoSummary, tag_address: u64, tag_size: u32) {
+    if tag_size < 17 {
+        return;
+    }
+    if unsafe { core::ptr::read((tag_address + tag_size as u64 - 1) as *const u8) } != 0 {
+        return;
+    }
+
+    let mut module = BootModule {
+        start: unsafe { read_u32(tag_address + 8) } as u64,
+        end: unsafe { read_u32(tag_address + 12) } as u64,
+        command_line: TextField::empty(),
+    };
+    module
+        .command_line
+        .set_from_c_string(tag_address + 16, tag_size as usize - 16);
+    summary.add_module(module);
 }
 
 fn parse_basic_memory(summary: &mut BootInfoSummary, tag_address: u64, tag_size: u32) {

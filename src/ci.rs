@@ -1,6 +1,6 @@
 use crate::{
-    elf, gdt, heap, interrupts, keyboard, klog, multiboot, paging, physmem, process, scheduler,
-    serial, shell, stats, syscall, user, user_program, vga,
+    elf, gdt, heap, initramfs, interrupts, keyboard, klog, multiboot, paging, physmem, process,
+    scheduler, serial, shell, stats, syscall, user, user_program, vga,
 };
 use x86_64::instructions::hlt;
 
@@ -217,6 +217,7 @@ fn run_command_table_checks() {
     check("command user", shell::command_exists(b"user"));
     check("command elf", shell::command_exists(b"elf"));
     check("command elftest", shell::command_exists(b"elftest"));
+    check("command initramfs", shell::command_exists(b"initramfs"));
     check("command process", shell::command_exists(b"process"));
     check("command tasks", shell::command_exists(b"tasks"));
     check("command sched", shell::command_exists(b"sched"));
@@ -251,6 +252,7 @@ fn run_selftest_checks() -> bool {
     let syscall_state = syscall::snapshot();
     let user_state = user::snapshot();
     let elf_state = elf::snapshot();
+    let initramfs_state = initramfs::snapshot();
     let interrupt_abi = interrupts::abi_snapshot();
 
     let mut ok = true;
@@ -270,7 +272,9 @@ fn run_selftest_checks() -> bool {
     );
     ok &= check(
         "selftest kernel memory protected",
-        frames.kernel_end > frames.kernel_start && frames.protected_until >= frames.kernel_end,
+        frames.kernel_end > frames.kernel_start
+            && frames.protected_until >= frames.kernel_end
+            && frames.protected_until >= boot_info.highest_module_end,
     );
     ok &= check(
         "selftest paging initialized",
@@ -361,6 +365,15 @@ fn run_selftest_checks() -> bool {
             && user_state.syscall_gate_ready,
     );
     ok &= check(
+        "selftest read-only initramfs",
+        boot_info.module_count >= 1
+            && initramfs_state.initialized
+            && initramfs_state.module_found
+            && initramfs_state.valid
+            && initramfs_state.init_found
+            && initramfs::selftest(),
+    );
+    ok &= check(
         "selftest ELF64 loader",
         elf_state.initialized
             && elf_state.loaded
@@ -400,7 +413,7 @@ fn run_selftest_checks() -> bool {
         "selftest keyboard queue sane",
         keyboard::pending_events() < 256,
     );
-    ok &= check("selftest command table sane", shell::command_count() >= 49);
+    ok &= check("selftest command table sane", shell::command_count() >= 50);
 
     ok
 }
@@ -415,6 +428,7 @@ fn run_user_mode_checks() -> bool {
 
 fn run_elf_loader_checks() -> bool {
     let loader = elf::snapshot();
+    let archive = initramfs::snapshot();
     let process_before = process::snapshot();
     let result = process::run_elf_init_task();
     let process_after = process::snapshot();
@@ -422,6 +436,19 @@ fn run_elf_loader_checks() -> bool {
     let data = paging::translate(paging::USER_ELF_BASE + paging::PAGE_SIZE_4K);
     let stack = paging::translate(paging::USER_ELF_STACK_PAGE);
     let mut ok = true;
+
+    ok &= check(
+        "initramfs module discovered",
+        archive.module_found && archive.archive_size > 0,
+    );
+    ok &= check(
+        "initramfs archive valid",
+        archive.valid && archive.last_error.is_none() && initramfs::selftest(),
+    );
+    ok &= check(
+        "initramfs /bin/init found",
+        archive.init_found && archive.init_size > 0 && initramfs::find("/bin/init").is_some(),
+    );
 
     ok &= check(
         "ELF loader initialized",

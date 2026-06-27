@@ -1,4 +1,4 @@
-use crate::{paging, physmem, serial, user_program};
+use crate::{initramfs, paging, physmem, serial, user_program};
 use core::cell::UnsafeCell;
 use x86_64::instructions::interrupts as cpu_interrupts;
 
@@ -16,6 +16,7 @@ const PF_READ: u32 = 4;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum LoadError {
     AlreadyLoaded,
+    InitProgramMissing,
     ImageTooSmall,
     BadMagic,
     UnsupportedClass,
@@ -158,7 +159,10 @@ pub fn init() -> Snapshot {
         }
 
         state.initialized = true;
-        match load_image(&user_program::INIT_ELF) {
+        let result = initramfs::find("/bin/init")
+            .ok_or(LoadError::InitProgramMissing)
+            .and_then(|file| load_image(file.data));
+        match result {
             Ok(image) => {
                 state.loaded = Some(image);
                 state.last_error = None;
@@ -218,6 +222,7 @@ pub fn selftest() -> bool {
     let text = paging::translate(snapshot.entry_point);
     let data = paging::translate(paging::USER_ELF_BASE + paging::PAGE_SIZE_4K);
     let stack = paging::translate(paging::USER_ELF_STACK_PAGE);
+    let init = initramfs::find("/bin/init");
 
     snapshot.initialized
         && snapshot.loaded
@@ -247,7 +252,10 @@ pub fn selftest() -> bool {
         && mapped_byte(
             paging::USER_ELF_BASE + paging::PAGE_SIZE_4K + user_program::INIT_BSS_PROBE_OFFSET,
         ) == Some(0)
-        && validate_image(&user_program::INIT_ELF).is_ok()
+        && initramfs::selftest()
+        && init
+            .map(|file| validate_image(file.data).is_ok())
+            .unwrap_or(false)
         && matches!(validate_image(&INVALID_IMAGE), Err(LoadError::BadMagic))
         && matches!(
             validate_image(&INVALID_IMAGE[..32]),
@@ -258,6 +266,7 @@ pub fn selftest() -> bool {
 pub fn load_error_name(error: LoadError) -> &'static str {
     match error {
         LoadError::AlreadyLoaded => "ELF image is already loaded",
+        LoadError::InitProgramMissing => "/bin/init is missing from initramfs",
         LoadError::ImageTooSmall => "ELF image is smaller than its header",
         LoadError::BadMagic => "ELF magic is invalid",
         LoadError::UnsupportedClass => "ELF class is not 64-bit",

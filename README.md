@@ -44,6 +44,12 @@ Belum masuk ke GUI, filesystem besar, user space kompleks, plugin, atau AI servi
 - TSS
 - IST untuk fault handling
 - Ring 3 user mode probe
+- ELF64 user program loader
+- Validasi header dan segment `PT_LOAD`
+- Permission user page W^X dan NX
+- Initramfs read-only format CPIO `newc`
+- `/bin/init` dimuat sebagai Multiboot2 module
+- `/bin/init` dijalankan otomatis di Ring 3
 - User page mapping terbatas
 - Syscall gate `int 0x80`
 - Minimal syscall ABI
@@ -70,6 +76,8 @@ Belum masuk ke GUI, filesystem besar, user space kompleks, plugin, atau AI servi
 - CI smoke test
 - CI stress test
 - CI fault test
+- CI kernel test matrix
+- CI khusus ELF loader dan initramfs
 
 ## Command yang Tersedia
 
@@ -96,6 +104,9 @@ Belum masuk ke GUI, filesystem besar, user space kompleks, plugin, atau AI servi
 - `irq`
 - `boot`
 - `user`
+- `elf`
+- `elftest`
+- `initramfs`
 - `usertest`
 - `syscall`
 - `gdt`
@@ -153,8 +164,8 @@ Target berikutnya
 - Process Control Block
 - Scheduler awal
 - Memory isolation lebih matang
-- User program loader pertama
-- ELF loader sederhana
+- Process address space terpisah
+- Lifecycle `/bin/init` jangka panjang
 - IPC dasar
 - Fault isolation untuk user process
 - CI test untuk user mode dan syscall

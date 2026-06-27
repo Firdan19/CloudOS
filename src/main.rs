@@ -10,6 +10,7 @@ mod ci;
 mod elf;
 mod gdt;
 mod heap;
+mod initramfs;
 mod interrupts;
 mod keyboard;
 mod klog;
@@ -174,12 +175,16 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info_addr: u32) ->
     serial::log_bool("boot", "multiboot magic", boot_info.valid_magic);
     serial::log_u64("boot", "multiboot info addr", boot_info.address);
     serial::log_u64("boot", "multiboot tags", boot_info.tag_count as u64);
+    serial::log_u64("boot", "multiboot modules", boot_info.module_count as u64);
+    serial::log_hex_u64("boot", "highest module end", boot_info.highest_module_end);
     serial::log_u64("mem", "usable bytes", boot_info.memory.usable_bytes);
     serial::log_u64(
         "mem",
         "memory regions",
         boot_info.memory.region_count as u64,
     );
+    let initramfs_state = initramfs::init();
+    serial::log_bool("initramfs", "archive valid", initramfs_state.valid);
     let frame_allocator = physmem::init();
     serial::log_u64("mem", "free frames", frame_allocator.free_frames);
     let paging_state = paging::init();
@@ -203,6 +208,10 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info_addr: u32) ->
     keyboard::init();
     serial::log("keyboard", "ps/2 controller drained");
     interrupts::init();
+    let init_result = process::run_elf_init_task();
+    serial::log_bool("init", "/bin/init entered Ring 3", init_result.ran);
+    serial::log_u64("init", "/bin/init exit code", init_result.exit_code);
+    serial::log_bool("init", "/bin/init status", init_result.passed);
     stats::mark_shell_ready(interrupts::ticks());
     ci::run_if_requested();
 

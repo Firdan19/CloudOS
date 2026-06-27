@@ -14,7 +14,10 @@ jobs:
         with:
           targets: x86_64-unknown-none
           components: rust-src, llvm-tools-preview, rustfmt
-      - run: cargo fmt --check
+      - name: Check Rust formatting
+        run: |
+          cargo fmt --check
+          rustfmt --edition 2021 --check tools/mkinitramfs.rs
       - name: Install GRUB ISO tools
         run: |
           sudo apt-get update
@@ -23,6 +26,10 @@ jobs:
         run: |
           mkdir -p target
           nasm -f elf64 src/interrupts.asm -o target/interrupts.o
+      - name: Build read-only initramfs
+        run: |
+          rustc --edition=2021 -O tools/mkinitramfs.rs -o target/mkinitramfs
+          target/mkinitramfs target/initramfs.cpio
       - name: Build release kernel
         env:
           TOBACCO_GIT_COMMIT: ${{ github.sha }}
@@ -38,6 +45,7 @@ jobs:
         run: |
           mkdir -p iso/boot/grub
           cp target/x86_64-unknown-none/release/tobacco-kernel iso/boot/tobacco-kernel
+          cp target/initramfs.cpio iso/boot/initramfs.cpio
           cp grub.cfg iso/boot/grub/grub.cfg
       - name: Create GRUB Multiboot2 ISO
         run: grub-mkrescue -o tobacco.iso iso
@@ -46,6 +54,7 @@ jobs:
           for mode in shell syscall elf userfault heap keyboard pagefault doublefault; do
             mkdir -p "iso-ci-${mode}/boot/grub"
             cp target/x86_64-unknown-none/release/tobacco-kernel "iso-ci-${mode}/boot/tobacco-kernel"
+            cp target/initramfs.cpio "iso-ci-${mode}/boot/initramfs.cpio"
             cp "scripts/grub-ci-${mode}.cfg" "iso-ci-${mode}/boot/grub/grub.cfg"
             grub-mkrescue -o "tobacco-ci-${mode}.iso" "iso-ci-${mode}"
           done

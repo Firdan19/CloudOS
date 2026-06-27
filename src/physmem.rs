@@ -130,6 +130,9 @@ impl FrameAllocator {
             self.protected_until = self.protected_until.max(boot_info_end);
         }
 
+        let module_end = align_up(multiboot::highest_module_end(), FRAME_SIZE);
+        self.protected_until = self.protected_until.max(module_end);
+
         for index in 0..multiboot::stored_region_count() {
             if let Some(region) = multiboot::region(index) {
                 self.add_memory_region(region);

@@ -1,7 +1,7 @@
 use crate::keyboard::{self, KeyEvent};
 use crate::{
-    buildinfo, elf, gdt, heap, interrupts, klog, multiboot, paging, paniclog, physmem, scheduler,
-    serial, stats, user_program, vga,
+    buildinfo, elf, gdt, heap, initramfs, interrupts, klog, multiboot, paging, paniclog, physmem,
+    scheduler, serial, stats, user_program, vga,
 };
 use crate::{process, syscall, user};
 use x86_64::instructions::interrupts as cpu_interrupts;
@@ -20,7 +20,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 49] = [
+const COMMANDS: [Command; 50] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -150,6 +150,11 @@ const COMMANDS: [Command; 49] = [
         name: "elf",
         description: "status loader ELF64 user",
         handler: command_elf,
+    },
+    Command {
+        name: "initramfs",
+        description: "daftar arsip boot read-only",
+        handler: command_initramfs,
     },
     Command {
         name: "elftest",
@@ -974,6 +979,7 @@ fn print_health_report() -> u64 {
     let scheduler_state = scheduler::snapshot();
     let syscall_state = syscall::snapshot();
     let user_state = user::snapshot();
+    let initramfs_state = initramfs::snapshot();
     let interrupt_abi = interrupts::abi_snapshot();
     let mut issues = 0u64;
 
@@ -1052,6 +1058,14 @@ fn print_health_report() -> u64 {
         &mut issues,
     );
     health_line(
+        "initramfs",
+        initramfs_state.initialized
+            && initramfs_state.valid
+            && initramfs_state.init_found
+            && initramfs::selftest(),
+        &mut issues,
+    );
+    health_line(
         "process model",
         process_state.initialized && process_state.running_tasks == 0 && process::selftest(),
         &mut issues,
@@ -1082,7 +1096,7 @@ fn print_health_report() -> u64 {
         keyboard::pending_events() < 256,
         &mut issues,
     );
-    health_line("command table", COMMANDS.len() >= 49, &mut issues);
+    health_line("command table", COMMANDS.len() >= 50, &mut issues);
     health_line("last panic", !panic.present, &mut issues);
 
     issues
@@ -1103,6 +1117,7 @@ fn health_issue_count() -> u64 {
     let scheduler_state = scheduler::snapshot();
     let syscall_state = syscall::snapshot();
     let user_state = user::snapshot();
+    let initramfs_state = initramfs::snapshot();
     let interrupt_abi = interrupts::abi_snapshot();
     let mut issues = 0u64;
 
@@ -1166,6 +1181,13 @@ fn health_issue_count() -> u64 {
         &mut issues,
     );
     count_issue(
+        initramfs_state.initialized
+            && initramfs_state.valid
+            && initramfs_state.init_found
+            && initramfs::selftest(),
+        &mut issues,
+    );
+    count_issue(
         process_state.initialized && process_state.running_tasks == 0 && process::selftest(),
         &mut issues,
     );
@@ -1184,7 +1206,7 @@ fn health_issue_count() -> u64 {
     );
     count_issue(ticks >= counters.shell_ready_tick, &mut issues);
     count_issue(keyboard::pending_events() < 256, &mut issues);
-    count_issue(COMMANDS.len() >= 49, &mut issues);
+    count_issue(COMMANDS.len() >= 50, &mut issues);
     count_issue(!panic.present, &mut issues);
 
     issues
@@ -1721,6 +1743,53 @@ fn command_elf(_arguments: &[u8]) {
     if let Some(error) = snapshot.last_error {
         print("  last error       : ");
         println(elf::load_error_name(error));
+    }
+}
+
+fn command_initramfs(_arguments: &[u8]) {
+    let snapshot = initramfs::snapshot();
+
+    println("Read-only initramfs:");
+    print("  module found     : ");
+    print_on_off(snapshot.module_found);
+    newline();
+    print("  archive valid    : ");
+    print_on_off(snapshot.valid);
+    newline();
+    print("  module range     : ");
+    print_hex_u64(snapshot.module_start);
+    print(" - ");
+    print_hex_u64(snapshot.module_end);
+    newline();
+    print_counter("archive bytes", snapshot.archive_size);
+    print_counter("entries", snapshot.entry_count);
+    print_counter("regular files", snapshot.regular_files);
+    print_counter("directories", snapshot.directories);
+    print_counter("file bytes", snapshot.total_file_bytes);
+    print("  /bin/init        : ");
+    print_on_off(snapshot.init_found);
+    print("  ");
+    print_u64(snapshot.init_size);
+    print(" bytes");
+    newline();
+
+    for index in 0..snapshot.entry_count as usize {
+        if let Some(entry) = initramfs::entry(index) {
+            print("  ");
+            print(entry.path.as_str());
+            if entry.directory {
+                print("/");
+            }
+            print("  ");
+            print_u64(entry.size);
+            print(" bytes");
+            newline();
+        }
+    }
+
+    if let Some(error) = snapshot.last_error {
+        print("  last error       : ");
+        println(initramfs::error_name(error));
     }
 }
 
@@ -2272,6 +2341,7 @@ fn command_selftest(_arguments: &[u8]) {
     let syscall_state = syscall::snapshot();
     let user_state = user::snapshot();
     let elf_state = elf::snapshot();
+    let initramfs_state = initramfs::snapshot();
     let interrupt_abi = interrupts::abi_snapshot();
 
     let mut passed = 0u64;
@@ -2306,7 +2376,9 @@ fn command_selftest(_arguments: &[u8]) {
     );
     selftest_check(
         "kernel memory protected",
-        frames.kernel_end > frames.kernel_start && frames.protected_until >= frames.kernel_end,
+        frames.kernel_end > frames.kernel_start
+            && frames.protected_until >= frames.kernel_end
+            && frames.protected_until >= boot_info.highest_module_end,
         &mut passed,
         &mut failed,
     );
@@ -2427,6 +2499,17 @@ fn command_selftest(_arguments: &[u8]) {
         &mut failed,
     );
     selftest_check(
+        "read-only initramfs",
+        boot_info.module_count >= 1
+            && initramfs_state.initialized
+            && initramfs_state.module_found
+            && initramfs_state.valid
+            && initramfs_state.init_found
+            && initramfs::selftest(),
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
         "ELF64 user loader",
         elf_state.initialized
             && elf_state.loaded
@@ -2507,7 +2590,7 @@ fn command_selftest(_arguments: &[u8]) {
     );
     selftest_check(
         "command table sane",
-        COMMANDS.len() >= 49,
+        COMMANDS.len() >= 50,
         &mut passed,
         &mut failed,
     );
