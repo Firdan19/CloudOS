@@ -199,7 +199,8 @@ impl ProcessTable {
         }
 
         self.initialized = true;
-        serial::log("process", "resource-owning task model ready");
+        serial::log("process", "task model ready");
+        serial::log("process", "resource ownership ready");
         serial::log_u64("process", "task capacity", MAX_TASKS as u64);
     }
 
