@@ -20,7 +20,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 53] = [
+const COMMANDS: [Command; 54] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -188,13 +188,18 @@ const COMMANDS: [Command; 53] = [
     },
     Command {
         name: "sched",
-        description: "status scheduler minimal",
+        description: "status scheduler preemptive",
         handler: command_scheduler,
     },
     Command {
         name: "scheduler",
         description: "alias untuk sched",
         handler: command_scheduler,
+    },
+    Command {
+        name: "preempt",
+        description: "uji round-robin preemptive Ring 3",
+        handler: command_preempt,
     },
     Command {
         name: "usertest",
@@ -1126,7 +1131,7 @@ fn print_health_report() -> u64 {
         keyboard::pending_events() < 256,
         &mut issues,
     );
-    health_line("command table", COMMANDS.len() >= 53, &mut issues);
+    health_line("command table", COMMANDS.len() >= 54, &mut issues);
     health_line("last panic", !panic.present, &mut issues);
 
     issues
@@ -1245,7 +1250,7 @@ fn health_issue_count() -> u64 {
     );
     count_issue(ticks >= counters.shell_ready_tick, &mut issues);
     count_issue(keyboard::pending_events() < 256, &mut issues);
-    count_issue(COMMANDS.len() >= 53, &mut issues);
+    count_issue(COMMANDS.len() >= 54, &mut issues);
     count_issue(!panic.present, &mut issues);
 
     issues
@@ -1599,6 +1604,7 @@ fn command_idt(_arguments: &[u8]) {
     serial::log("idt", "idt status requested");
     println("IDT/Interrupt ABI:");
     print_counter("idt entry bytes", abi.idt_entry_bytes);
+    print_counter("timer ctx bytes", abi.timer_context_bytes);
     print_counter("exception ctx", abi.exception_context_bytes);
     print("  timer gate       : ");
     print_on_off(abi.timer_gate_present);
@@ -1962,6 +1968,9 @@ fn command_process(_arguments: &[u8]) {
     print_counter("ctx switches", scheduler_snapshot.context_switches);
     print_counter("yield calls", scheduler_snapshot.cooperative_yields);
     print_counter("task ticks", scheduler_snapshot.accounted_ticks);
+    print_counter("timer preempts", scheduler_snapshot.timer_preemptions);
+    print_counter("preempt tests", snapshot.preemption_runs);
+    print_counter("preempt passes", snapshot.preemption_passes);
 
     print_task_rows();
 }
@@ -2071,6 +2080,10 @@ fn print_task_rows() {
             print_u64(task.owned_user_pages);
             print(" runs=");
             print_u64(task.runs);
+            print(" slices=");
+            print_u64(task.scheduled_slices);
+            print(" preempt=");
+            print_u64(task.timer_preemptions);
             print(" exit=");
             print_u64(task.exit_code);
             print(" syscalls=");
@@ -2099,6 +2112,55 @@ fn command_scheduler(_arguments: &[u8]) {
     print_counter("task ticks", snapshot.accounted_ticks);
     print_counter("failed enqueue", snapshot.failed_enqueues);
     print_counter("last switch", snapshot.last_switch_tick);
+    print_counter("quantum", snapshot.quantum_ticks);
+    print_counter("slice ticks", snapshot.slice_ticks);
+    print_counter("timer preempts", snapshot.timer_preemptions);
+    print_counter("rr rotations", snapshot.round_robin_rotations);
+    print_counter("starvation guard", snapshot.starvation_preventions);
+    print_counter("maximum wait", snapshot.max_wait_ticks);
+}
+
+fn command_preempt(_arguments: &[u8]) {
+    println("Preemptive scheduler test:");
+    let report = process::run_preemption_test();
+
+    print("  entered Ring 3   : ");
+    print_on_off(report.ran);
+    newline();
+    print_counter("first task", report.first_task);
+    print_counter("second task", report.second_task);
+    print_counter("timer switches", report.timer_switches);
+    print_counter("first slices", report.first_slices);
+    print_counter("second slices", report.second_slices);
+    print_counter("maximum wait", report.max_wait_ticks);
+    print("  round robin      : ");
+    print_on_off(report.round_robin_balanced);
+    newline();
+    print("  starvation bound : ");
+    print_on_off(report.starvation_bounded);
+    newline();
+    print("  private CR3      : ");
+    print_on_off(report.distinct_roots);
+    newline();
+    print("  private frames   : ");
+    print_on_off(report.distinct_user_frames);
+    newline();
+    print("  frame baseline   : ");
+    print_on_off(report.frames_restored);
+    newline();
+    print("  heap baseline    : ");
+    print_on_off(report.heap_restored);
+    newline();
+    print("  resource baseline: ");
+    print_on_off(report.resources_restored);
+    newline();
+    print("  status           : ");
+    if report.passed {
+        println("PASS");
+    } else {
+        stats::inc_shell_error();
+        println("FAIL");
+    }
 }
 
 fn command_syscall(_arguments: &[u8]) {
@@ -2732,7 +2794,7 @@ fn command_selftest(_arguments: &[u8]) {
     );
     selftest_check(
         "command table sane",
-        COMMANDS.len() >= 53,
+        COMMANDS.len() >= 54,
         &mut passed,
         &mut failed,
     );

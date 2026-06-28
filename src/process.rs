@@ -1,10 +1,20 @@
-use crate::{elf, heap, paging, scheduler, serial, user, user_program};
+use crate::{elf, gdt, heap, interrupts, paging, scheduler, serial, user, user_program};
 use core::cell::UnsafeCell;
 use x86_64::instructions::interrupts as cpu_interrupts;
 
 pub const MAX_TASKS: usize = 8;
 const TASK_HEAP_BYTES: u64 = 128;
 const TASK_HEAP_ALIGNMENT: u64 = 64;
+const PREEMPT_TEST_SWITCHES: u64 = 8;
+const PREEMPT_TEST_EXIT_CODE: u64 = 0x5052;
+const SPIN_PROGRAM: [u8; 4] = [0xf3, 0x90, 0xeb, 0xfc];
+
+#[derive(Clone, Copy)]
+pub enum TimerAction {
+    Continue,
+    Switch(u64),
+    Stop(u64),
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
@@ -34,6 +44,10 @@ pub struct Task {
     pub cleanup_user_frames: u64,
     pub cleanup_table_frames: u64,
     pub heap_released: bool,
+    pub timer_preemptions: u64,
+    pub scheduled_slices: u64,
+    pub last_scheduled_tick: u64,
+    pub max_wait_ticks: u64,
 }
 
 impl Task {
@@ -57,6 +71,10 @@ impl Task {
             cleanup_user_frames: 0,
             cleanup_table_frames: 0,
             heap_released: false,
+            timer_preemptions: 0,
+            scheduled_slices: 0,
+            last_scheduled_tick: 0,
+            max_wait_ticks: 0,
         }
     }
 }
@@ -81,6 +99,9 @@ pub struct Snapshot {
     pub heap_releases: u64,
     pub last_task_id: u64,
     pub last_exit_code: u64,
+    pub preemption_active: bool,
+    pub preemption_runs: u64,
+    pub preemption_passes: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -142,9 +163,30 @@ pub struct IsolationReport {
     pub passed: bool,
 }
 
+#[derive(Clone, Copy)]
+pub struct PreemptionReport {
+    pub ran: bool,
+    pub passed: bool,
+    pub first_task: u64,
+    pub second_task: u64,
+    pub timer_switches: u64,
+    pub first_slices: u64,
+    pub second_slices: u64,
+    pub max_wait_ticks: u64,
+    pub round_robin_balanced: bool,
+    pub starvation_bounded: bool,
+    pub distinct_roots: bool,
+    pub distinct_user_frames: bool,
+    pub frames_restored: bool,
+    pub heap_restored: bool,
+    pub resources_restored: bool,
+}
+
 struct ProcessSlot {
     task: Task,
     address_space: paging::AddressSpace,
+    timer_context: interrupts::TimerContext,
+    context_valid: bool,
 }
 
 impl ProcessSlot {
@@ -152,6 +194,8 @@ impl ProcessSlot {
         Self {
             task: Task::empty(),
             address_space: paging::AddressSpace::empty(),
+            timer_context: interrupts::TimerContext::empty(),
+            context_valid: false,
         }
     }
 }
@@ -170,6 +214,11 @@ struct ProcessTable {
     active_resources: u64,
     last_task_id: u64,
     last_exit_code: u64,
+    preemption_active: bool,
+    preemption_target: u64,
+    preemption_switches: u64,
+    preemption_runs: u64,
+    preemption_passes: u64,
     slots: [ProcessSlot; MAX_TASKS],
 }
 
@@ -189,6 +238,11 @@ impl ProcessTable {
             active_resources: 0,
             last_task_id: 0,
             last_exit_code: 0,
+            preemption_active: false,
+            preemption_target: 0,
+            preemption_switches: 0,
+            preemption_runs: 0,
+            preemption_passes: 0,
             slots: [const { ProcessSlot::empty() }; MAX_TASKS],
         }
     }
@@ -247,6 +301,9 @@ impl ProcessTable {
             heap_releases: self.heap_releases,
             last_task_id: self.last_task_id,
             last_exit_code: self.last_exit_code,
+            preemption_active: self.preemption_active,
+            preemption_runs: self.preemption_runs,
+            preemption_passes: self.preemption_passes,
         }
     }
 
@@ -284,6 +341,56 @@ impl ProcessTable {
                 return None;
             }
         };
+
+        let heap_allocation = match heap::alloc(TASK_HEAP_BYTES, TASK_HEAP_ALIGNMENT) {
+            Some(address) => address,
+            None => {
+                let _ = image.address_space.destroy();
+                self.failed_spawns = self.failed_spawns.saturating_add(1);
+                serial::log("process", "task heap allocation failed");
+                return None;
+            }
+        };
+
+        let task = self.install_task(
+            image.entry_point,
+            image.stack_top,
+            image.address_space,
+            image.first_user_frame,
+            image.mapped_pages,
+            image.table_frames,
+            heap_allocation,
+        );
+        if task.is_none() {
+            let _ = heap::free(heap_allocation);
+        }
+        task
+    }
+
+    fn spawn_preempt_task(&mut self) -> Option<Task> {
+        let mut image = match elf::create_process_image() {
+            Ok(image) => image,
+            Err(error) => {
+                self.failed_spawns = self.failed_spawns.saturating_add(1);
+                serial::log("process", elf::load_error_name(error));
+                return None;
+            }
+        };
+
+        let translation = image.address_space.translate(image.entry_point);
+        if !translation.mapped || !translation.user_accessible || !translation.executable {
+            let _ = image.address_space.destroy();
+            self.failed_spawns = self.failed_spawns.saturating_add(1);
+            serial::log("sched", "preemption program mapping invalid");
+            return None;
+        }
+
+        unsafe {
+            let destination = translation.phys as *mut u8;
+            for (offset, byte) in SPIN_PROGRAM.iter().copied().enumerate() {
+                destination.add(offset).write_volatile(byte);
+            }
+        }
 
         let heap_allocation = match heap::alloc(TASK_HEAP_BYTES, TASK_HEAP_ALIGNMENT) {
             Some(address) => address,
@@ -354,11 +461,17 @@ impl ProcessTable {
             cleanup_user_frames: 0,
             cleanup_table_frames: 0,
             heap_released: false,
+            timer_preemptions: 0,
+            scheduled_slices: 0,
+            last_scheduled_tick: 0,
+            max_wait_ticks: 0,
         };
 
         self.slots[index] = ProcessSlot {
             task,
             address_space,
+            timer_context: initial_timer_context(entry_point, stack_top),
+            context_valid: true,
         };
         self.spawned_tasks = self.spawned_tasks.saturating_add(1);
         self.active_resources = self.active_resources.saturating_add(1);
@@ -378,6 +491,8 @@ impl ProcessTable {
         task.state = TaskState::Running;
         task.syscalls_before = syscalls_before;
         task.runs = task.runs.saturating_add(1);
+        task.scheduled_slices = task.scheduled_slices.saturating_add(1);
+        task.last_scheduled_tick = interrupts::ticks();
         self.last_task_id = id;
         serial::log_u64("process", "task running", id);
         scheduler::begin_task(id);
@@ -452,6 +567,74 @@ impl ProcessTable {
         complete
     }
 
+    fn start_preemption_test(&mut self) {
+        self.preemption_active = true;
+        self.preemption_target = PREEMPT_TEST_SWITCHES;
+        self.preemption_switches = 0;
+        self.preemption_runs = self.preemption_runs.saturating_add(1);
+    }
+
+    fn stop_preemption_test(&mut self, passed: bool) -> u64 {
+        self.preemption_active = false;
+        self.preemption_target = 0;
+        let switches = self.preemption_switches;
+        if passed {
+            self.preemption_passes = self.preemption_passes.saturating_add(1);
+        }
+        switches
+    }
+
+    fn on_timer_interrupt(&mut self, context: &mut interrupts::TimerContext) -> TimerAction {
+        if !self.preemption_active || !context.from_user() {
+            return TimerAction::Continue;
+        }
+
+        if self.preemption_switches >= self.preemption_target {
+            return TimerAction::Stop(PREEMPT_TEST_EXIT_CODE);
+        }
+
+        let decision = scheduler::preempt_current_from_irq();
+        if !decision.switched {
+            return TimerAction::Continue;
+        }
+
+        let Some(previous_index) = self.find_task(decision.previous_task) else {
+            self.preemption_active = false;
+            return TimerAction::Stop(PREEMPT_TEST_EXIT_CODE + 1);
+        };
+        let Some(next_index) = self.find_task(decision.next_task) else {
+            self.preemption_active = false;
+            return TimerAction::Stop(PREEMPT_TEST_EXIT_CODE + 2);
+        };
+
+        self.slots[previous_index].timer_context = *context;
+        self.slots[previous_index].context_valid = true;
+        self.slots[previous_index].task.state = TaskState::Ready;
+        self.slots[previous_index].task.timer_preemptions = self.slots[previous_index]
+            .task
+            .timer_preemptions
+            .saturating_add(1);
+
+        if !self.slots[next_index].context_valid
+            || self.slots[next_index].task.address_space_root == 0
+        {
+            self.preemption_active = false;
+            return TimerAction::Stop(PREEMPT_TEST_EXIT_CODE + 3);
+        }
+
+        let next_task = &mut self.slots[next_index].task;
+        next_task.state = TaskState::Running;
+        next_task.runs = next_task.runs.saturating_add(1);
+        next_task.scheduled_slices = next_task.scheduled_slices.saturating_add(1);
+        next_task.last_scheduled_tick = interrupts::ticks();
+        next_task.max_wait_ticks = next_task.max_wait_ticks.max(decision.waited_ticks);
+
+        self.preemption_switches = self.preemption_switches.saturating_add(1);
+        self.last_task_id = decision.next_task;
+        *context = self.slots[next_index].timer_context;
+        TimerAction::Switch(self.slots[next_index].task.address_space_root)
+    }
+
     fn free_slot(&self) -> Option<usize> {
         for index in 0..MAX_TASKS {
             let task = self.slots[index].task;
@@ -479,6 +662,10 @@ impl ProcessTable {
         }
         Some(self.slots[index].task)
     }
+
+    fn task_by_id(&self, id: u64) -> Option<Task> {
+        self.find_task(id).map(|index| self.slots[index].task)
+    }
 }
 
 struct ProcessStore {
@@ -502,6 +689,10 @@ pub fn snapshot() -> Snapshot {
 
 pub fn task(index: usize) -> Option<Task> {
     cpu_interrupts::without_interrupts(|| table().task(index))
+}
+
+pub fn on_timer_interrupt(context: &mut interrupts::TimerContext) -> TimerAction {
+    table_mut().on_timer_interrupt(context)
 }
 
 pub fn run_user_probe_task() -> TaskRunResult {
@@ -612,6 +803,152 @@ pub fn run_isolation_test() -> IsolationReport {
     }
 }
 
+pub fn run_preemption_test() -> PreemptionReport {
+    let frames_before = crate::physmem::snapshot();
+    let heap_before = heap::snapshot();
+    let resources_before = snapshot().active_resources;
+    let scheduler_before = scheduler::snapshot();
+    let first = cpu_interrupts::without_interrupts(|| table_mut().spawn_preempt_task());
+    let second = cpu_interrupts::without_interrupts(|| table_mut().spawn_preempt_task());
+
+    let first_id = first.map(|task| task.id).unwrap_or(0);
+    let second_id = second.map(|task| task.id).unwrap_or(0);
+    let distinct_roots = match (first, second) {
+        (Some(first), Some(second)) => {
+            first.address_space_root != 0 && first.address_space_root != second.address_space_root
+        }
+        _ => false,
+    };
+    let distinct_user_frames = match (first, second) {
+        (Some(first), Some(second)) => {
+            first.first_user_frame != 0 && first.first_user_frame != second.first_user_frame
+        }
+        _ => false,
+    };
+
+    let mut ran = false;
+    let mut user_passed = false;
+    if let (Some(first), Some(_second)) = (first, second) {
+        let syscalls_before = user::snapshot().syscall_count;
+        let running = cpu_interrupts::without_interrupts(|| {
+            let table = table_mut();
+            let running = table.mark_running(first.id, syscalls_before);
+            if running {
+                table.start_preemption_test();
+            }
+            running
+        });
+
+        if running {
+            let result = user::run_program_in_address_space(
+                first.entry_point,
+                first.stack_top,
+                PREEMPT_TEST_EXIT_CODE,
+                0,
+                first.address_space_root,
+            );
+            ran = result.ran;
+            user_passed = result.passed;
+        }
+    }
+
+    let (first_task, second_task, timer_switches) = cpu_interrupts::without_interrupts(|| {
+        let table = table_mut();
+        let first_task = table.task_by_id(first_id).unwrap_or(Task::empty());
+        let second_task = table.task_by_id(second_id).unwrap_or(Task::empty());
+        let switches = table.stop_preemption_test(false);
+        (first_task, second_task, switches)
+    });
+
+    let syscalls_after = user::snapshot().syscall_count;
+    if first_id != 0 {
+        cpu_interrupts::without_interrupts(|| {
+            let _ = table_mut().mark_exited(first_id, PREEMPT_TEST_EXIT_CODE, syscalls_after);
+        });
+    }
+    if second_id != 0 {
+        cpu_interrupts::without_interrupts(|| {
+            let _ = table_mut().mark_exited(second_id, PREEMPT_TEST_EXIT_CODE, syscalls_after);
+        });
+    }
+
+    let first_cleaned =
+        first_id != 0 && cpu_interrupts::without_interrupts(|| table_mut().cleanup_task(first_id));
+    let second_cleaned = second_id != 0
+        && cpu_interrupts::without_interrupts(|| table_mut().cleanup_task(second_id));
+    let scheduler_after = scheduler::snapshot();
+    let frames_after = crate::physmem::snapshot();
+    let heap_after = heap::snapshot();
+    let resources_after = snapshot().active_resources;
+
+    let first_slices = first_task.scheduled_slices;
+    let second_slices = second_task.scheduled_slices;
+    let slice_difference = first_slices.abs_diff(second_slices);
+    let max_wait_ticks = first_task.max_wait_ticks.max(second_task.max_wait_ticks);
+    let round_robin_balanced = first_slices >= 2 && second_slices >= 2 && slice_difference <= 1;
+    let starvation_bounded = max_wait_ticks
+        <= scheduler::STARVATION_LIMIT_TICKS.saturating_add(scheduler::DEFAULT_QUANTUM_TICKS);
+    let frames_restored = frames_after.allocated_frames == frames_before.allocated_frames
+        && frames_after.free_frames == frames_before.free_frames;
+    let heap_restored = heap_after.active_allocations == heap_before.active_allocations
+        && heap_after.allocated_bytes == heap_before.allocated_bytes
+        && heap_after.free_bytes == heap_before.free_bytes
+        && heap_after.metadata_ok
+        && heap_after.sentinel_ok
+        && heap_after.allocation_canaries_ok;
+    let resources_restored = resources_after == resources_before;
+    let scheduler_advanced = scheduler_after.timer_preemptions
+        >= scheduler_before
+            .timer_preemptions
+            .saturating_add(PREEMPT_TEST_SWITCHES);
+    let passed = ran
+        && user_passed
+        && timer_switches >= PREEMPT_TEST_SWITCHES
+        && scheduler_advanced
+        && round_robin_balanced
+        && starvation_bounded
+        && distinct_roots
+        && distinct_user_frames
+        && first_cleaned
+        && second_cleaned
+        && frames_restored
+        && heap_restored
+        && resources_restored;
+
+    cpu_interrupts::without_interrupts(|| {
+        if passed {
+            let table = table_mut();
+            table.preemption_passes = table.preemption_passes.saturating_add(1);
+        }
+    });
+
+    serial::log_u64("sched", "timer context switches", timer_switches);
+    serial::log_u64("sched", "first task slices", first_slices);
+    serial::log_u64("sched", "second task slices", second_slices);
+    serial::log_u64("sched", "maximum wait ticks", max_wait_ticks);
+    serial::log_bool("sched", "round robin balanced", round_robin_balanced);
+    serial::log_bool("sched", "starvation bounded", starvation_bounded);
+    serial::log_bool("sched", "preemption test", passed);
+
+    PreemptionReport {
+        ran,
+        passed,
+        first_task: first_id,
+        second_task: second_id,
+        timer_switches,
+        first_slices,
+        second_slices,
+        max_wait_ticks,
+        round_robin_balanced,
+        starvation_bounded,
+        distinct_roots,
+        distinct_user_frames,
+        frames_restored,
+        heap_restored,
+        resources_restored,
+    }
+}
+
 fn run_spawned_task(
     task: Option<Task>,
     fallback_entry: u64,
@@ -699,6 +1036,7 @@ pub fn selftest() -> bool {
         && snapshot.task_capacity == MAX_TASKS as u64
         && snapshot.running_tasks == 0
         && snapshot.active_resources == 0
+        && !snapshot.preemption_active
         && snapshot.cleanup_failures == 0
         && snapshot.next_task_id >= 1
         && address_spaces.active == 0
@@ -708,6 +1046,36 @@ pub fn selftest() -> bool {
         && user::probe_stack_top() != 0
         && user::probe_expected_exit_code() == 42
         && elf::selftest()
+}
+
+fn initial_timer_context(entry_point: u64, stack_top: u64) -> interrupts::TimerContext {
+    let user_data = gdt::USER_DATA_SELECTOR as u64;
+    interrupts::TimerContext {
+        gs: user_data,
+        fs: user_data,
+        es: user_data,
+        ds: user_data,
+        r15: 0,
+        r14: 0,
+        r13: 0,
+        r12: 0,
+        r11: 0,
+        r10: 0,
+        r9: 0,
+        r8: 0,
+        rbp: 0,
+        rdi: 0,
+        rsi: 0,
+        rdx: 0,
+        rcx: 0,
+        rbx: 0,
+        rax: 0,
+        instruction_pointer: entry_point,
+        code_segment: gdt::USER_CODE_SELECTOR as u64,
+        cpu_flags: 0x202,
+        stack_pointer: stack_top,
+        stack_segment: user_data,
+    }
 }
 
 pub fn state_name(state: TaskState) -> &'static str {

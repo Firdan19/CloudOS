@@ -1,5 +1,5 @@
 use crate::keyboard::KeyEvent;
-use crate::{gdt, keyboard, paging, paniclog, scheduler, serial, stats, user, vga};
+use crate::{gdt, keyboard, paging, paniclog, process, scheduler, serial, stats, user, vga};
 use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use x86_64::instructions::interrupts as cpu_interrupts;
@@ -73,9 +73,84 @@ pub struct ExceptionContext {
 }
 
 #[derive(Clone, Copy)]
+#[repr(C)]
+pub struct TimerContext {
+    pub gs: u64,
+    pub fs: u64,
+    pub es: u64,
+    pub ds: u64,
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rbp: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rbx: u64,
+    pub rax: u64,
+    pub instruction_pointer: u64,
+    pub code_segment: u64,
+    pub cpu_flags: u64,
+    pub stack_pointer: u64,
+    pub stack_segment: u64,
+}
+
+impl TimerContext {
+    pub const fn empty() -> Self {
+        Self {
+            gs: 0,
+            fs: 0,
+            es: 0,
+            ds: 0,
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            r11: 0,
+            r10: 0,
+            r9: 0,
+            r8: 0,
+            rbp: 0,
+            rdi: 0,
+            rsi: 0,
+            rdx: 0,
+            rcx: 0,
+            rbx: 0,
+            rax: 0,
+            instruction_pointer: 0,
+            code_segment: 0,
+            cpu_flags: 0,
+            stack_pointer: 0,
+            stack_segment: 0,
+        }
+    }
+
+    pub fn from_user(&self) -> bool {
+        self.code_segment & 0x3 == 0x3
+    }
+}
+
+const _: [(); 192] = [(); size_of::<TimerContext>()];
+const _: [(); 24] = [(); core::mem::offset_of!(TimerContext, ds)];
+const _: [(); 32] = [(); core::mem::offset_of!(TimerContext, r15)];
+const _: [(); 144] = [(); core::mem::offset_of!(TimerContext, rax)];
+const _: [(); 152] = [(); core::mem::offset_of!(TimerContext, instruction_pointer)];
+const _: [(); 160] = [(); core::mem::offset_of!(TimerContext, code_segment)];
+const _: [(); 168] = [(); core::mem::offset_of!(TimerContext, cpu_flags)];
+const _: [(); 176] = [(); core::mem::offset_of!(TimerContext, stack_pointer)];
+const _: [(); 184] = [(); core::mem::offset_of!(TimerContext, stack_segment)];
+
+#[derive(Clone, Copy)]
 pub struct AbiSnapshot {
     pub idt_entry_bytes: u64,
     pub exception_context_bytes: u64,
+    pub timer_context_bytes: u64,
     pub timer_gate_present: bool,
     pub keyboard_gate_present: bool,
     pub syscall_gate_present: bool,
@@ -180,6 +255,7 @@ pub fn abi_snapshot() -> AbiSnapshot {
         AbiSnapshot {
             idt_entry_bytes: size_of::<IdtEntry>() as u64,
             exception_context_bytes: size_of::<ExceptionContext>() as u64,
+            timer_context_bytes: size_of::<TimerContext>() as u64,
             timer_gate_present: gate_present(timer),
             keyboard_gate_present: gate_present(keyboard),
             syscall_gate_present: gate_present(syscall),
@@ -317,14 +393,32 @@ unsafe fn send_eoi(irq: u8) {
 }
 
 #[no_mangle]
-pub extern "C" fn timer_interrupt_handler() {
+pub extern "C" fn timer_interrupt_handler(context: *mut TimerContext) -> u64 {
     stats::inc_timer_irq();
     PIT_TICKS.fetch_add(1, Ordering::Relaxed);
     scheduler::on_timer_tick();
     vga::toggle_cursor();
 
+    let from_user = if context.is_null() {
+        false
+    } else {
+        let code_segment = unsafe { core::ptr::addr_of!((*context).code_segment).read() };
+        code_segment & 0x3 == 0x3
+    };
+    let action = if !from_user {
+        process::TimerAction::Continue
+    } else {
+        process::on_timer_interrupt(unsafe { &mut *context })
+    };
+
     unsafe {
         send_eoi(TIMER_IRQ);
+    }
+
+    match action {
+        process::TimerAction::Continue => 0,
+        process::TimerAction::Switch(address_space_root) => address_space_root,
+        process::TimerAction::Stop(exit_code) => unsafe { user::exit_to_kernel(exit_code) },
     }
 }
 

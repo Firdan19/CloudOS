@@ -142,7 +142,25 @@ extern exception_dispatch_handler
 %endmacro
 
 timer_interrupt_stub:
-    call_rust_handler timer_interrupt_handler
+    push_regs
+    save_segments
+    load_kernel_segments
+    mov rdi, rsp
+    mov rax, rsp
+    and rsp, -16
+    sub rsp, 16
+    mov [rsp], rax
+    cld
+    call timer_interrupt_handler
+    mov r11, rax
+    mov rsp, [rsp]
+    test r11, r11
+    jz .restore_context
+    mov cr3, r11
+.restore_context:
+    restore_segments
+    pop_regs
+    iretq
 
 keyboard_interrupt_stub:
     call_rust_handler keyboard_interrupt_handler
@@ -254,7 +272,7 @@ user_enter:
     push rsi
     pushfq
     pop rax
-    and rax, 0xfffffffffffffdff
+    or rax, 0x200
     push rax
     push rcx
     push rdi

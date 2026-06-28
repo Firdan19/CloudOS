@@ -224,6 +224,26 @@ case "$TEST_SUITE" in
         assert_log "$log_path" "[ci] keyboard model complete"
         assert_no_kernel_failure "$log_path"
         ;;
+    scheduler-preemption)
+        log_path="serial-scheduler-preemption.log"
+        run_qemu "$IMAGE_DIR/tobacco-ci-preempt.iso" "$log_path" "$TIMEOUT_SECONDS"
+        assert_boot_baseline "$log_path"
+        assert_log "$log_path" "[ci] scheduler preemption requested"
+        assert_log "$log_path" "[ci] preempt tasks spawned"
+        assert_log "$log_path" "[ci] preempt entered Ring 3"
+        assert_log "$log_path" "[ci] preempt timer context switches"
+        assert_log "$log_path" "[ci] preempt round robin balanced"
+        assert_log "$log_path" "[ci] preempt starvation bounded"
+        assert_log "$log_path" "[ci] preempt private CR3"
+        assert_log "$log_path" "[ci] preempt private frames"
+        assert_log "$log_path" "[ci] preempt frame baseline"
+        assert_log "$log_path" "[ci] preempt heap baseline"
+        assert_log "$log_path" "[ci] preempt resource baseline"
+        assert_log "$log_path" "[ci] preempt scheduler model"
+        assert_log "$log_path" "[ci] scheduler preemption status: PASS"
+        assert_log "$log_path" "[ci] scheduler preemption complete"
+        assert_no_kernel_failure "$log_path"
+        ;;
     panic-fault-screen)
         page_log="serial-panic-fault-screen-pagefault.log"
         double_log="serial-panic-fault-screen-doublefault.log"

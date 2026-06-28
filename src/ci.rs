@@ -11,6 +11,7 @@ const CI_ELF_FLAG: &[u8] = b"tobacco.ci=elf";
 const CI_USER_FAULT_FLAG: &[u8] = b"tobacco.ci=userfault";
 const CI_HEAP_FLAG: &[u8] = b"tobacco.ci=heap";
 const CI_KEYBOARD_FLAG: &[u8] = b"tobacco.ci=keyboard";
+const CI_PREEMPT_FLAG: &[u8] = b"tobacco.ci=preempt";
 const CI_PAGE_FAULT_FLAG: &[u8] = b"tobacco.ci=pagefault";
 const CI_DOUBLE_FAULT_FLAG: &[u8] = b"tobacco.ci=doublefault";
 const VGA_BUFFER_ADDRESS: u64 = 0x000b_8000;
@@ -59,6 +60,11 @@ pub fn run_if_requested() {
 
         if contains_bytes(command_line, CI_KEYBOARD_FLAG) {
             run_keyboard_model_matrix();
+            return;
+        }
+
+        if contains_bytes(command_line, CI_PREEMPT_FLAG) {
+            run_preemption_matrix();
             return;
         }
 
@@ -169,6 +175,17 @@ fn run_keyboard_model_matrix() {
     serial::log("ci", "keyboard model complete");
 }
 
+fn run_preemption_matrix() {
+    serial::log("ci", "scheduler preemption requested");
+    if run_preemption_checks() {
+        serial::log("ci", "scheduler preemption status: PASS");
+    } else {
+        serial::log("ci", "scheduler preemption status: FAIL");
+    }
+
+    serial::log("ci", "scheduler preemption complete");
+}
+
 fn trigger_page_fault_for_ci() -> ! {
     let target = paging::KERNEL_HEAP_GUARD_LOW;
     serial::log("ci-fault", "page fault trigger requested");
@@ -227,6 +244,7 @@ fn run_command_table_checks() {
     );
     check("command tasks", shell::command_exists(b"tasks"));
     check("command sched", shell::command_exists(b"sched"));
+    check("command preempt", shell::command_exists(b"preempt"));
     check("command usertest", shell::command_exists(b"usertest"));
     check("command tasktest", shell::command_exists(b"tasktest"));
     check("command faulttest", shell::command_exists(b"faulttest"));
@@ -355,6 +373,7 @@ fn run_selftest_checks() -> bool {
         "selftest interrupt abi hardened",
         interrupt_abi.idt_entry_bytes == 16
             && interrupt_abi.exception_context_bytes == 40
+            && interrupt_abi.timer_context_bytes == 192
             && interrupt_abi.timer_gate_present
             && interrupt_abi.keyboard_gate_present
             && interrupt_abi.syscall_gate_present
@@ -427,7 +446,7 @@ fn run_selftest_checks() -> bool {
         "selftest keyboard queue sane",
         keyboard::pending_events() < 256,
     );
-    ok &= check("selftest command table sane", shell::command_count() >= 53);
+    ok &= check("selftest command table sane", shell::command_count() >= 54);
 
     ok
 }
@@ -625,6 +644,43 @@ fn run_syscall_probe_checks() -> bool {
             && syscall_after.last_return == syscall::RET_OK,
     );
 
+    ok
+}
+
+fn run_preemption_checks() -> bool {
+    let scheduler_before = scheduler::snapshot();
+    let process_before = process::snapshot();
+    let report = process::run_preemption_test();
+    let scheduler_after = scheduler::snapshot();
+    let process_after = process::snapshot();
+    let mut ok = true;
+
+    ok &= check(
+        "preempt tasks spawned",
+        report.first_task > 0 && report.second_task > 0,
+    );
+    ok &= check("preempt entered Ring 3", report.ran);
+    ok &= check(
+        "preempt timer context switches",
+        report.timer_switches >= 8
+            && scheduler_after.timer_preemptions
+                >= scheduler_before.timer_preemptions.saturating_add(8),
+    );
+    ok &= check("preempt round robin balanced", report.round_robin_balanced);
+    ok &= check("preempt starvation bounded", report.starvation_bounded);
+    ok &= check("preempt private CR3", report.distinct_roots);
+    ok &= check("preempt private frames", report.distinct_user_frames);
+    ok &= check("preempt frame baseline", report.frames_restored);
+    ok &= check("preempt heap baseline", report.heap_restored);
+    ok &= check("preempt resource baseline", report.resources_restored);
+    ok &= check(
+        "preempt process accounting",
+        process_after.preemption_runs > process_before.preemption_runs
+            && process_after.preemption_passes > process_before.preemption_passes
+            && !process_after.preemption_active,
+    );
+    ok &= check("preempt scheduler model", scheduler::selftest());
+    ok &= check("preempt status", report.passed);
     ok
 }
 
