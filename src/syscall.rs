@@ -9,6 +9,8 @@ pub const SYSCALL_IPC_SEND: u64 = 5;
 pub const SYSCALL_IPC_RECEIVE: u64 = 6;
 pub const SYSCALL_GETPID: u64 = 7;
 pub const SYSCALL_IPC_SELF: u64 = 8;
+pub const SYSCALL_IPC_RECEIVE_TIMEOUT: u64 = 9;
+pub const SYSCALL_IPC_CANCEL: u64 = 10;
 
 pub const RET_OK: u64 = 0;
 pub const RET_UNKNOWN_SYSCALL: u64 = u64::MAX;
@@ -66,7 +68,7 @@ pub struct Snapshot {
     pub last_return: u64,
 }
 
-const SYSCALLS: [SyscallEntry; 8] = [
+const SYSCALLS: [SyscallEntry; 10] = [
     SyscallEntry {
         number: SYSCALL_LOG,
         name: "log",
@@ -130,6 +132,22 @@ const SYSCALLS: [SyscallEntry; 8] = [
         return_code: ReturnCode::Dynamic,
         logging: true,
         handler: syscall_ipc_self,
+    },
+    SyscallEntry {
+        number: SYSCALL_IPC_RECEIVE_TIMEOUT,
+        name: "ipc_receive_timeout",
+        arg_count: 3,
+        return_code: ReturnCode::Dynamic,
+        logging: true,
+        handler: syscall_ipc_receive_timeout,
+    },
+    SyscallEntry {
+        number: SYSCALL_IPC_CANCEL,
+        name: "ipc_cancel",
+        arg_count: 1,
+        return_code: ReturnCode::Dynamic,
+        logging: true,
+        handler: syscall_ipc_cancel,
     },
 ];
 
@@ -214,7 +232,7 @@ pub fn lookup(number: u64) -> Option<&'static SyscallEntry> {
 
 pub fn selftest() -> bool {
     INITIALIZED.load(Ordering::Acquire)
-        && SYSCALLS.len() == 8
+        && SYSCALLS.len() == 10
         && lookup(SYSCALL_LOG).is_some()
         && lookup(SYSCALL_UPTIME).is_some()
         && lookup(SYSCALL_EXIT).is_some()
@@ -223,6 +241,8 @@ pub fn selftest() -> bool {
         && lookup(SYSCALL_IPC_RECEIVE).is_some()
         && lookup(SYSCALL_GETPID).is_some()
         && lookup(SYSCALL_IPC_SELF).is_some()
+        && lookup(SYSCALL_IPC_RECEIVE_TIMEOUT).is_some()
+        && lookup(SYSCALL_IPC_CANCEL).is_some()
         && table_numbers_unique()
         && SYSCALLS[0].arg_count == 1
         && SYSCALLS[1].arg_count == 0
@@ -232,6 +252,8 @@ pub fn selftest() -> bool {
         && SYSCALLS[5].arg_count == 2
         && SYSCALLS[6].arg_count == 0
         && SYSCALLS[7].arg_count == 0
+        && SYSCALLS[8].arg_count == 3
+        && SYSCALLS[9].arg_count == 1
 }
 
 pub fn return_code_name(code: ReturnCode) -> &'static str {
@@ -290,6 +312,19 @@ fn syscall_ipc_send(handle: u64, frame: &mut user::SyscallFrame) -> SyscallOutco
 }
 
 fn syscall_ipc_receive(buffer: u64, frame: &mut user::SyscallFrame) -> SyscallOutcome {
+    syscall_ipc_receive_common(buffer, frame, None)
+}
+
+fn syscall_ipc_receive_timeout(buffer: u64, frame: &mut user::SyscallFrame) -> SyscallOutcome {
+    let timeout_ticks = frame.rdx;
+    syscall_ipc_receive_common(buffer, frame, Some(timeout_ticks))
+}
+
+fn syscall_ipc_receive_common(
+    buffer: u64,
+    frame: &mut user::SyscallFrame,
+    timeout_ticks: Option<u64>,
+) -> SyscallOutcome {
     let receiver = scheduler::snapshot().current_task;
     let capacity = (frame.rsi as usize).min(ipc::MAX_MESSAGE_BYTES);
     if receiver == 0 {
@@ -297,6 +332,16 @@ fn syscall_ipc_receive(buffer: u64, frame: &mut user::SyscallFrame) -> SyscallOu
     }
     if !process::validate_user_buffer(receiver, buffer, capacity as u64, true).valid {
         return SyscallOutcome::complete(RET_INVALID_USER_BUFFER);
+    }
+
+    match process::take_ipc_wake_reason(receiver) {
+        process::IpcWakeReason::Timeout => {
+            return SyscallOutcome::complete(ipc_error_return(ipc::IpcError::Timeout));
+        }
+        process::IpcWakeReason::Cancelled => {
+            return SyscallOutcome::complete(ipc_error_return(ipc::IpcError::Cancelled));
+        }
+        process::IpcWakeReason::None | process::IpcWakeReason::Message => {}
     }
 
     let mut message = [0u8; ipc::MAX_MESSAGE_BYTES];
@@ -315,13 +360,23 @@ fn syscall_ipc_receive(buffer: u64, frame: &mut user::SyscallFrame) -> SyscallOu
         Ok(ipc::ReceiveOutcome::Blocked) => {
             SyscallOutcome::complete(ipc_error_return(ipc::IpcError::BlockFailed))
         }
-        Err(ipc::IpcError::QueueEmpty) => match ipc::block_syscall(receiver, frame) {
-            Ok(ipc::SyscallBlockOutcome::Switched(address_space_root)) => {
-                SyscallOutcome::switch(address_space_root)
+        Err(ipc::IpcError::QueueEmpty) => {
+            if timeout_ticks == Some(0) {
+                return SyscallOutcome::complete(ipc_error_return(ipc::IpcError::Timeout));
             }
-            Ok(ipc::SyscallBlockOutcome::MessageReady) => syscall_ipc_receive(buffer, frame),
-            Err(error) => SyscallOutcome::complete(ipc_error_return(error)),
-        },
+            let deadline_tick = timeout_ticks
+                .map(|ticks| interrupts::ticks().saturating_add(ticks))
+                .unwrap_or(0);
+            match ipc::block_syscall(receiver, frame, deadline_tick) {
+                Ok(ipc::SyscallBlockOutcome::Switched(address_space_root)) => {
+                    SyscallOutcome::switch(address_space_root)
+                }
+                Ok(ipc::SyscallBlockOutcome::MessageReady) => {
+                    syscall_ipc_receive_common(buffer, frame, timeout_ticks)
+                }
+                Err(error) => SyscallOutcome::complete(ipc_error_return(error)),
+            }
+        }
         Err(error) => SyscallOutcome::complete(ipc_error_return(error)),
     }
 }
@@ -340,6 +395,19 @@ fn syscall_ipc_self(_arg0: u64, _frame: &mut user::SyscallFrame) -> SyscallOutco
                 serial::log_hex_u64("ipc-cap", "self capability issued", handle);
                 handle
             }
+            Err(error) => ipc_error_return(error),
+        }
+    };
+    SyscallOutcome::complete(result)
+}
+
+fn syscall_ipc_cancel(handle: u64, _frame: &mut user::SyscallFrame) -> SyscallOutcome {
+    let requester = scheduler::snapshot().current_task;
+    let result = if requester == 0 {
+        ipc_error_return(ipc::IpcError::InvalidTask)
+    } else {
+        match ipc::cancel_wait(requester, handle) {
+            Ok(target) => target,
             Err(error) => ipc_error_return(error),
         }
     };

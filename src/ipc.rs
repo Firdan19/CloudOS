@@ -15,14 +15,16 @@ pub struct CapabilityRights(u8);
 impl CapabilityRights {
     pub const SEND: Self = Self(1 << 0);
     pub const RECEIVE: Self = Self(1 << 1);
+    pub const CANCEL: Self = Self(1 << 2);
     pub const SEND_RECEIVE: Self = Self(Self::SEND.0 | Self::RECEIVE.0);
+    pub const ALL: Self = Self(Self::SEND_RECEIVE.0 | Self::CANCEL.0);
 
     pub const fn bits(self) -> u8 {
         self.0
     }
 
     const fn valid(self) -> bool {
-        self.0 != 0 && self.0 & !Self::SEND_RECEIVE.0 == 0
+        self.0 != 0 && self.0 & !Self::ALL.0 == 0
     }
 
     const fn contains(self, required: Self) -> bool {
@@ -47,6 +49,9 @@ pub enum IpcError {
     StaleCapability,
     PermissionDenied,
     InvalidRights,
+    Timeout,
+    Cancelled,
+    NotWaiting,
 }
 
 #[derive(Clone, Copy)]
@@ -94,6 +99,8 @@ pub struct Snapshot {
     pub capability_denials: u64,
     pub stale_capability_denials: u64,
     pub last_capability_generation: u64,
+    pub cancellation_requests: u64,
+    pub cancellation_successes: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -215,6 +222,8 @@ struct IpcState {
     capability_denials: u64,
     stale_capability_denials: u64,
     last_capability_generation: u64,
+    cancellation_requests: u64,
+    cancellation_successes: u64,
 }
 
 impl IpcState {
@@ -239,6 +248,8 @@ impl IpcState {
             capability_denials: 0,
             stale_capability_denials: 0,
             last_capability_generation: 0,
+            cancellation_requests: 0,
+            cancellation_successes: 0,
         }
     }
 
@@ -273,7 +284,7 @@ impl IpcState {
         self.endpoints[index].capabilities[0] = Capability {
             target: task_id,
             generation,
-            rights: CapabilityRights::SEND_RECEIVE,
+            rights: CapabilityRights::ALL,
             active: true,
         };
         self.endpoints_created = self.endpoints_created.saturating_add(1);
@@ -593,6 +604,8 @@ impl IpcState {
             capability_denials: self.capability_denials,
             stale_capability_denials: self.stale_capability_denials,
             last_capability_generation: self.last_capability_generation,
+            cancellation_requests: self.cancellation_requests,
+            cancellation_successes: self.cancellation_successes,
         }
     }
 
@@ -654,6 +667,25 @@ pub fn revoke_capability(owner: u64, handle: u64) -> Result<(), IpcError> {
     cpu_interrupts::without_interrupts(|| state_mut().revoke(owner, handle))
 }
 
+pub fn cancel_wait(requester: u64, handle: u64) -> Result<u64, IpcError> {
+    cpu_interrupts::without_interrupts(|| {
+        let state = state_mut();
+        state.cancellation_requests = state.cancellation_requests.saturating_add(1);
+        let target = state_mut().resolve(requester, handle, CapabilityRights::CANCEL)?;
+        if !process::cancel_ipc_wait(target) {
+            return Err(IpcError::NotWaiting);
+        }
+        state_mut().set_waiting(target, false)?;
+        let state = state_mut();
+        state.cancellation_successes = state.cancellation_successes.saturating_add(1);
+        Ok(target)
+    })
+}
+
+pub fn clear_waiting(task_id: u64) -> Result<(), IpcError> {
+    cpu_interrupts::without_interrupts(|| state_mut().set_waiting(task_id, false))
+}
+
 pub fn send(sender: u64, receiver: u64, bytes: &[u8]) -> Result<u64, IpcError> {
     let (sequence, wake_receiver) =
         cpu_interrupts::without_interrupts(|| state_mut().send(sender, receiver, bytes))?;
@@ -707,6 +739,7 @@ pub fn receive(
 pub fn block_syscall(
     receiver: u64,
     frame: &mut user::SyscallFrame,
+    deadline_tick: u64,
 ) -> Result<SyscallBlockOutcome, IpcError> {
     cpu_interrupts::without_interrupts(|| {
         state_mut().can_receive(receiver)?;
@@ -715,7 +748,9 @@ pub fn block_syscall(
         }
 
         state_mut().set_waiting(receiver, true)?;
-        let Some(address_space_root) = process::block_for_ipc_syscall(receiver, frame) else {
+        let Some(address_space_root) =
+            process::block_for_ipc_syscall(receiver, frame, deadline_tick)
+        else {
             let _ = state_mut().set_waiting(receiver, false);
             return Err(IpcError::BlockFailed);
         };
@@ -755,6 +790,9 @@ pub fn error_code(error: IpcError) -> u64 {
         IpcError::StaleCapability => 13,
         IpcError::PermissionDenied => 14,
         IpcError::InvalidRights => 15,
+        IpcError::Timeout => 16,
+        IpcError::Cancelled => 17,
+        IpcError::NotWaiting => 18,
     }
 }
 
@@ -775,6 +813,9 @@ pub fn error_name(error: IpcError) -> &'static str {
         IpcError::StaleCapability => "stale capability",
         IpcError::PermissionDenied => "permission denied",
         IpcError::InvalidRights => "invalid capability rights",
+        IpcError::Timeout => "receive timeout",
+        IpcError::Cancelled => "receive cancelled",
+        IpcError::NotWaiting => "receiver is not waiting",
     }
 }
 
@@ -785,6 +826,9 @@ fn model_selftest() -> bool {
     let self_capability = state.self_capability(1);
     let send_capability = state.grant(1, 2, CapabilityRights::SEND);
     let receive_only = state.grant(1, 1, CapabilityRights::RECEIVE);
+    let cancel_capability = state.grant(1, 2, CapabilityRights::CANCEL);
+    let cancel_resolved =
+        cancel_capability.and_then(|handle| state.resolve(1, handle, CapabilityRights::CANCEL));
     let sent = send_capability.and_then(|handle| state.send_capability(1, handle, b"ping"));
     let mut output = [0u8; MAX_MESSAGE_BYTES];
     let received = state.receive(2, &mut output);
@@ -808,6 +852,7 @@ fn model_selftest() -> bool {
         && &output[..4] == b"ping"
         && permission_denied
         && stale_denied
+        && cancel_resolved == Ok(2)
         && state.unregister(1).is_ok()
         && state.unregister(2).is_ok()
         && state.snapshot().active_endpoints == 0

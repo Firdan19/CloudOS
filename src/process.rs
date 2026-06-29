@@ -68,6 +68,36 @@ impl UserCodeBuilder {
         self.syscall(crate::syscall::SYSCALL_IPC_RECEIVE);
     }
 
+    fn receive_timeout(&mut self, timeout_ticks: u64) {
+        self.mov_imm64(0xbf, IPC_TEST_BUFFER);
+        self.mov_imm64(0xbe, ipc::MAX_MESSAGE_BYTES as u64);
+        self.mov_imm64(0xba, timeout_ticks);
+        self.syscall(crate::syscall::SYSCALL_IPC_RECEIVE_TIMEOUT);
+    }
+
+    fn cancel(&mut self, capability: u64) {
+        self.mov_imm64(0xbf, capability);
+        self.syscall(crate::syscall::SYSCALL_IPC_CANCEL);
+    }
+
+    fn wait_ticks(&mut self, ticks: u8) {
+        self.syscall(crate::syscall::SYSCALL_UPTIME);
+        self.bytes(&[0x49, 0x89, 0xc4]);
+        self.bytes(&[0x49, 0x83, 0xc4, ticks]);
+        self.syscall(crate::syscall::SYSCALL_UPTIME);
+        self.bytes(&[0x4c, 0x39, 0xe0]);
+        self.bytes(&[0x72, 0xef]);
+    }
+
+    fn expect_rax_and_exit(&mut self, expected: u64, success: u64, failure: u64) {
+        self.bytes(&[0x49, 0xbc]);
+        self.bytes(&expected.to_le_bytes());
+        self.bytes(&[0x4c, 0x39, 0xe0]);
+        self.bytes(&[0x75, 0x16]);
+        self.exit(success);
+        self.exit(failure);
+    }
+
     fn exit(&mut self, code: u64) {
         self.mov_imm64(0xbf, code);
         self.syscall(crate::syscall::SYSCALL_EXIT);
@@ -88,6 +118,14 @@ pub enum TaskState {
     Running,
     Blocked,
     Exited,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum IpcWakeReason {
+    None,
+    Message,
+    Timeout,
+    Cancelled,
 }
 
 #[derive(Clone, Copy)]
@@ -118,6 +156,8 @@ pub struct Task {
     pub wait_target: u64,
     pub ipc_waiting: bool,
     pub ipc_restart_pending: bool,
+    pub ipc_deadline_tick: u64,
+    pub ipc_wake_reason: IpcWakeReason,
 }
 
 impl Task {
@@ -149,6 +189,8 @@ impl Task {
             wait_target: 0,
             ipc_waiting: false,
             ipc_restart_pending: false,
+            ipc_deadline_tick: 0,
+            ipc_wake_reason: IpcWakeReason::None,
         }
     }
 }
@@ -183,6 +225,8 @@ pub struct Snapshot {
     pub parent_wakeups: u64,
     pub ipc_blocking_switches: u64,
     pub ipc_restart_completions: u64,
+    pub ipc_timeouts: u64,
+    pub ipc_cancellations: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -361,6 +405,23 @@ pub struct CapabilityTestReport {
     pub passed: bool,
 }
 
+#[derive(Clone, Copy)]
+pub struct IpcWaitControlReport {
+    pub timeout_ran: bool,
+    pub timeout_exit_code: u64,
+    pub timeout_wakeups: u64,
+    pub cancellation_ran: bool,
+    pub cancellation_exit_code: u64,
+    pub cancellation_wakeups: u64,
+    pub restart_completions: u64,
+    pub scheduler_clean: bool,
+    pub endpoint_clean: bool,
+    pub frames_restored: bool,
+    pub heap_restored: bool,
+    pub resources_restored: bool,
+    pub passed: bool,
+}
+
 struct ProcessSlot {
     task: Task,
     address_space: paging::AddressSpace,
@@ -403,6 +464,8 @@ struct ProcessTable {
     parent_wakeups: u64,
     ipc_blocking_switches: u64,
     ipc_restart_completions: u64,
+    ipc_timeouts: u64,
+    ipc_cancellations: u64,
     slots: [ProcessSlot; MAX_TASKS],
 }
 
@@ -432,6 +495,8 @@ impl ProcessTable {
             parent_wakeups: 0,
             ipc_blocking_switches: 0,
             ipc_restart_completions: 0,
+            ipc_timeouts: 0,
+            ipc_cancellations: 0,
             slots: [const { ProcessSlot::empty() }; MAX_TASKS],
         }
     }
@@ -509,6 +574,8 @@ impl ProcessTable {
             parent_wakeups: self.parent_wakeups,
             ipc_blocking_switches: self.ipc_blocking_switches,
             ipc_restart_completions: self.ipc_restart_completions,
+            ipc_timeouts: self.ipc_timeouts,
+            ipc_cancellations: self.ipc_cancellations,
         }
     }
 
@@ -652,23 +719,6 @@ impl ProcessTable {
         peer_capability: u64,
         receiver_first: bool,
     ) -> bool {
-        let Some(index) = self.find_task(task_id) else {
-            return false;
-        };
-        let entry_point = self.slots[index].task.entry_point;
-        let code = self.slots[index].address_space.translate(entry_point);
-        let data = self.slots[index].address_space.translate(IPC_TEST_DATA);
-        if !code.mapped
-            || !code.user_accessible
-            || !code.executable
-            || data.phys == 0
-            || !data.mapped
-            || !data.user_accessible
-            || !data.writable
-        {
-            return false;
-        }
-
         let mut program = UserCodeBuilder::new();
         if receiver_first {
             program.receive();
@@ -684,6 +734,65 @@ impl ProcessTable {
             program.receive();
             program.exit(IPC_TEST_EXIT_CODE);
             program.bytes(&[0xf4, 0xeb, 0xfd]);
+        }
+        self.write_user_program(task_id, &program)
+    }
+
+    fn install_ipc_timeout_program(&mut self, task_id: u64, receiver: bool) -> bool {
+        let mut program = UserCodeBuilder::new();
+        if receiver {
+            program.receive_timeout(2);
+            program.expect_rax_and_exit(
+                crate::syscall::ipc_error_return(ipc::IpcError::Timeout),
+                IPC_TEST_EXIT_CODE,
+                IPC_TEST_EXIT_CODE + 1,
+            );
+        } else {
+            program.wait_ticks(3);
+            program.receive_timeout(100);
+            program.bytes(&[0xf4, 0xeb, 0xfd]);
+        }
+        self.write_user_program(task_id, &program)
+    }
+
+    fn install_ipc_cancel_program(
+        &mut self,
+        task_id: u64,
+        cancel_capability: u64,
+        receiver: bool,
+    ) -> bool {
+        let mut program = UserCodeBuilder::new();
+        if receiver {
+            program.receive_timeout(100);
+            program.expect_rax_and_exit(
+                crate::syscall::ipc_error_return(ipc::IpcError::Cancelled),
+                IPC_TEST_EXIT_CODE,
+                IPC_TEST_EXIT_CODE + 1,
+            );
+        } else {
+            program.cancel(cancel_capability);
+            program.receive_timeout(100);
+            program.bytes(&[0xf4, 0xeb, 0xfd]);
+        }
+        self.write_user_program(task_id, &program)
+    }
+
+    fn write_user_program(&mut self, task_id: u64, program: &UserCodeBuilder) -> bool {
+        let Some(index) = self.find_task(task_id) else {
+            return false;
+        };
+        let entry_point = self.slots[index].task.entry_point;
+        let code = self.slots[index].address_space.translate(entry_point);
+        let data = self.slots[index].address_space.translate(IPC_TEST_DATA);
+        if !code.mapped
+            || !code.user_accessible
+            || !code.executable
+            || data.phys == 0
+            || !data.mapped
+            || !data.user_accessible
+            || !data.writable
+        {
+            return false;
         }
         if !program.valid || program.len > paging::PAGE_SIZE_4K as usize {
             return false;
@@ -764,6 +873,8 @@ impl ProcessTable {
             wait_target: 0,
             ipc_waiting: false,
             ipc_restart_pending: false,
+            ipc_deadline_tick: 0,
+            ipc_wake_reason: IpcWakeReason::None,
         };
 
         self.slots[index] = ProcessSlot {
@@ -810,6 +921,8 @@ impl ProcessTable {
         self.slots[index].task.syscalls_after = syscalls_after;
         self.slots[index].task.ipc_waiting = false;
         self.slots[index].task.ipc_restart_pending = false;
+        self.slots[index].task.ipc_deadline_tick = 0;
+        self.slots[index].task.ipc_wake_reason = IpcWakeReason::None;
         self.exited_total = self.exited_total.saturating_add(1);
         self.last_task_id = id;
         self.last_exit_code = exit_code;
@@ -1032,6 +1145,8 @@ impl ProcessTable {
 
         self.slots[index].task.state = TaskState::Blocked;
         self.slots[index].task.ipc_waiting = true;
+        self.slots[index].task.ipc_deadline_tick = 0;
+        self.slots[index].task.ipc_wake_reason = IpcWakeReason::None;
         serial::log_u64("ipc", "receiver blocked", task_id);
         true
     }
@@ -1040,6 +1155,7 @@ impl ProcessTable {
         &mut self,
         task_id: u64,
         frame: &mut user::SyscallFrame,
+        deadline_tick: u64,
     ) -> Option<u64> {
         let previous_index = self.find_task(task_id)?;
         let previous = self.slots[previous_index].task;
@@ -1070,6 +1186,8 @@ impl ProcessTable {
         self.slots[previous_index].task.state = TaskState::Blocked;
         self.slots[previous_index].task.ipc_waiting = true;
         self.slots[previous_index].task.ipc_restart_pending = true;
+        self.slots[previous_index].task.ipc_deadline_tick = deadline_tick;
+        self.slots[previous_index].task.ipc_wake_reason = IpcWakeReason::None;
 
         let next_task = &mut self.slots[next_index].task;
         next_task.state = TaskState::Running;
@@ -1100,8 +1218,70 @@ impl ProcessTable {
 
         self.slots[index].task.state = TaskState::Ready;
         self.slots[index].task.ipc_waiting = false;
+        self.slots[index].task.ipc_deadline_tick = 0;
+        self.slots[index].task.ipc_wake_reason = IpcWakeReason::Message;
         serial::log_u64("ipc", "receiver woken", task_id);
         true
+    }
+
+    fn cancel_ipc_wait(&mut self, task_id: u64) -> bool {
+        let Some(index) = self.find_task(task_id) else {
+            return false;
+        };
+        if self.slots[index].task.state != TaskState::Blocked || !self.slots[index].task.ipc_waiting
+        {
+            return false;
+        }
+        if !scheduler::wake_task(task_id) {
+            return false;
+        }
+
+        self.slots[index].task.state = TaskState::Ready;
+        self.slots[index].task.ipc_waiting = false;
+        self.slots[index].task.ipc_deadline_tick = 0;
+        self.slots[index].task.ipc_wake_reason = IpcWakeReason::Cancelled;
+        self.ipc_cancellations = self.ipc_cancellations.saturating_add(1);
+        serial::log_u64("ipc", "receiver cancelled", task_id);
+        true
+    }
+
+    fn expire_ipc_deadlines(&mut self, now: u64) {
+        for index in 0..MAX_TASKS {
+            let task = self.slots[index].task;
+            if task.state != TaskState::Blocked
+                || !task.ipc_waiting
+                || task.ipc_deadline_tick == 0
+                || now < task.ipc_deadline_tick
+            {
+                continue;
+            }
+            if !scheduler::wake_task(task.id) {
+                continue;
+            }
+
+            let _ = ipc::clear_waiting(task.id);
+            self.slots[index].task.state = TaskState::Ready;
+            self.slots[index].task.ipc_waiting = false;
+            self.slots[index].task.ipc_deadline_tick = 0;
+            self.slots[index].task.ipc_wake_reason = IpcWakeReason::Timeout;
+            self.ipc_timeouts = self.ipc_timeouts.saturating_add(1);
+            serial::log_u64("ipc", "receiver timeout", task.id);
+        }
+    }
+
+    fn take_ipc_wake_reason(&mut self, task_id: u64) -> IpcWakeReason {
+        let Some(index) = self.find_task(task_id) else {
+            return IpcWakeReason::None;
+        };
+        let reason = self.slots[index].task.ipc_wake_reason;
+        self.slots[index].task.ipc_wake_reason = IpcWakeReason::None;
+        if matches!(reason, IpcWakeReason::Timeout | IpcWakeReason::Cancelled)
+            && self.slots[index].task.ipc_restart_pending
+        {
+            self.slots[index].task.ipc_restart_pending = false;
+            self.ipc_restart_completions = self.ipc_restart_completions.saturating_add(1);
+        }
+        reason
     }
 
     fn complete_ipc_restart(&mut self, task_id: u64) -> bool {
@@ -1113,6 +1293,8 @@ impl ProcessTable {
         }
 
         self.slots[index].task.ipc_restart_pending = false;
+        self.slots[index].task.ipc_deadline_tick = 0;
+        self.slots[index].task.ipc_wake_reason = IpcWakeReason::None;
         self.ipc_restart_completions = self.ipc_restart_completions.saturating_add(1);
         serial::log_u64("ipc", "blocking syscall resumed", task_id);
         true
@@ -1373,12 +1555,22 @@ pub fn on_timer_interrupt(context: &mut interrupts::TimerContext) -> TimerAction
     table_mut().on_timer_interrupt(context)
 }
 
+pub fn on_timer_tick(now: u64) {
+    table_mut().expire_ipc_deadlines(now);
+}
+
 pub fn block_for_ipc(task_id: u64) -> bool {
     cpu_interrupts::without_interrupts(|| table_mut().block_for_ipc(task_id))
 }
 
-pub fn block_for_ipc_syscall(task_id: u64, frame: &mut user::SyscallFrame) -> Option<u64> {
-    cpu_interrupts::without_interrupts(|| table_mut().block_for_ipc_syscall(task_id, frame))
+pub fn block_for_ipc_syscall(
+    task_id: u64,
+    frame: &mut user::SyscallFrame,
+    deadline_tick: u64,
+) -> Option<u64> {
+    cpu_interrupts::without_interrupts(|| {
+        table_mut().block_for_ipc_syscall(task_id, frame, deadline_tick)
+    })
 }
 
 pub fn wake_from_ipc(task_id: u64) -> bool {
@@ -1387,6 +1579,14 @@ pub fn wake_from_ipc(task_id: u64) -> bool {
 
 pub fn complete_ipc_restart(task_id: u64) -> bool {
     cpu_interrupts::without_interrupts(|| table_mut().complete_ipc_restart(task_id))
+}
+
+pub fn cancel_ipc_wait(task_id: u64) -> bool {
+    cpu_interrupts::without_interrupts(|| table_mut().cancel_ipc_wait(task_id))
+}
+
+pub fn take_ipc_wake_reason(task_id: u64) -> IpcWakeReason {
+    cpu_interrupts::without_interrupts(|| table_mut().take_ipc_wake_reason(task_id))
 }
 
 pub fn run_user_probe_task() -> TaskRunResult {
@@ -2026,6 +2226,189 @@ pub fn run_capability_test() -> CapabilityTestReport {
     }
 }
 
+pub fn run_ipc_wait_control_test() -> IpcWaitControlReport {
+    let frames_before = crate::physmem::snapshot();
+    let heap_before = heap::snapshot();
+    let resources_before = snapshot().active_resources;
+    let process_before = snapshot();
+    let scheduler_before = scheduler::snapshot();
+    let ipc_before = ipc::snapshot();
+
+    let timeout_receiver = cpu_interrupts::without_interrupts(|| table_mut().spawn_elf_init());
+    let timeout_peer = cpu_interrupts::without_interrupts(|| table_mut().spawn_elf_init());
+    let timeout_receiver_id = timeout_receiver.map(|task| task.id).unwrap_or(0);
+    let timeout_peer_id = timeout_peer.map(|task| task.id).unwrap_or(0);
+    let timeout_configured = timeout_receiver_id != 0
+        && timeout_peer_id != 0
+        && cpu_interrupts::without_interrupts(|| {
+            let table = table_mut();
+            table.install_ipc_timeout_program(timeout_receiver_id, true)
+                && table.install_ipc_timeout_program(timeout_peer_id, false)
+        });
+
+    let mut timeout_ran = false;
+    let mut timeout_passed = false;
+    let mut timeout_exit_code = 0;
+    if timeout_configured {
+        let before = user::snapshot().syscall_count;
+        if cpu_interrupts::without_interrupts(|| {
+            table_mut().mark_running(timeout_receiver_id, before)
+        }) {
+            let result = user::run_program_in_address_space(
+                timeout_receiver.map(|task| task.entry_point).unwrap_or(0),
+                timeout_receiver.map(|task| task.stack_top).unwrap_or(0),
+                IPC_TEST_EXIT_CODE,
+                5,
+                timeout_receiver
+                    .map(|task| task.address_space_root)
+                    .unwrap_or(0),
+            );
+            timeout_ran = result.ran;
+            timeout_passed = result.passed;
+            timeout_exit_code = result.exit_code;
+        }
+    }
+
+    let syscalls = user::snapshot().syscall_count;
+    for task_id in [timeout_receiver_id, timeout_peer_id] {
+        if task_id == 0 {
+            continue;
+        }
+        cpu_interrupts::without_interrupts(|| {
+            let _ = table_mut().mark_exited(task_id, timeout_exit_code, syscalls);
+            let _ = table_mut().cleanup_task(task_id);
+        });
+    }
+
+    let cancel_receiver = cpu_interrupts::without_interrupts(|| table_mut().spawn_elf_init());
+    let canceller = cpu_interrupts::without_interrupts(|| table_mut().spawn_elf_init());
+    let cancel_receiver_id = cancel_receiver.map(|task| task.id).unwrap_or(0);
+    let canceller_id = canceller.map(|task| task.id).unwrap_or(0);
+    let cancel_capability = if cancel_receiver_id != 0 && canceller_id != 0 {
+        ipc::grant_capability(
+            canceller_id,
+            cancel_receiver_id,
+            ipc::CapabilityRights::CANCEL,
+        )
+        .ok()
+    } else {
+        None
+    };
+    let cancel_configured = if let Some(capability) = cancel_capability {
+        cpu_interrupts::without_interrupts(|| {
+            let table = table_mut();
+            table.install_ipc_cancel_program(cancel_receiver_id, 0, true)
+                && table.install_ipc_cancel_program(canceller_id, capability, false)
+        })
+    } else {
+        false
+    };
+
+    let mut cancellation_ran = false;
+    let mut cancellation_passed = false;
+    let mut cancellation_exit_code = 0;
+    if cancel_configured {
+        let before = user::snapshot().syscall_count;
+        if cpu_interrupts::without_interrupts(|| {
+            table_mut().mark_running(cancel_receiver_id, before)
+        }) {
+            let result = user::run_program_in_address_space(
+                cancel_receiver.map(|task| task.entry_point).unwrap_or(0),
+                cancel_receiver.map(|task| task.stack_top).unwrap_or(0),
+                IPC_TEST_EXIT_CODE,
+                5,
+                cancel_receiver
+                    .map(|task| task.address_space_root)
+                    .unwrap_or(0),
+            );
+            cancellation_ran = result.ran;
+            cancellation_passed = result.passed;
+            cancellation_exit_code = result.exit_code;
+        }
+    }
+
+    let syscalls = user::snapshot().syscall_count;
+    for task_id in [cancel_receiver_id, canceller_id] {
+        if task_id == 0 {
+            continue;
+        }
+        cpu_interrupts::without_interrupts(|| {
+            let _ = table_mut().mark_exited(task_id, cancellation_exit_code, syscalls);
+            let _ = table_mut().cleanup_task(task_id);
+        });
+    }
+
+    let process_after = snapshot();
+    let scheduler_after = scheduler::snapshot();
+    let ipc_after = ipc::snapshot();
+    let frames_after = crate::physmem::snapshot();
+    let heap_after = heap::snapshot();
+    let resources_after = snapshot().active_resources;
+    let timeout_wakeups = process_after
+        .ipc_timeouts
+        .saturating_sub(process_before.ipc_timeouts);
+    let cancellation_wakeups = process_after
+        .ipc_cancellations
+        .saturating_sub(process_before.ipc_cancellations);
+    let restart_completions = process_after
+        .ipc_restart_completions
+        .saturating_sub(process_before.ipc_restart_completions);
+    let scheduler_clean = scheduler_after.current_task == scheduler_before.current_task
+        && scheduler_after.queued_tasks == scheduler_before.queued_tasks
+        && scheduler_after.blocked_tasks == scheduler_before.blocked_tasks;
+    let endpoint_clean = ipc_after.active_endpoints == ipc_before.active_endpoints
+        && ipc_after.active_capabilities == ipc_before.active_capabilities
+        && ipc_after.queued_messages == ipc_before.queued_messages
+        && ipc_after.waiting_receivers == ipc_before.waiting_receivers;
+    let frames_restored = frames_after.allocated_frames == frames_before.allocated_frames
+        && frames_after.free_frames == frames_before.free_frames;
+    let heap_restored = heap_after.active_allocations == heap_before.active_allocations
+        && heap_after.allocated_bytes == heap_before.allocated_bytes
+        && heap_after.free_bytes == heap_before.free_bytes
+        && heap_after.metadata_ok
+        && heap_after.sentinel_ok
+        && heap_after.allocation_canaries_ok;
+    let resources_restored = resources_after == resources_before;
+    let passed = timeout_ran
+        && timeout_passed
+        && timeout_exit_code == IPC_TEST_EXIT_CODE
+        && timeout_wakeups == 1
+        && cancellation_ran
+        && cancellation_passed
+        && cancellation_exit_code == IPC_TEST_EXIT_CODE
+        && cancellation_wakeups == 1
+        && restart_completions == 2
+        && ipc_after.cancellation_successes == ipc_before.cancellation_successes.saturating_add(1)
+        && scheduler_clean
+        && endpoint_clean
+        && frames_restored
+        && heap_restored
+        && resources_restored;
+
+    serial::log_bool("ipc-wait", "timeout Ring 3", timeout_passed);
+    serial::log_u64("ipc-wait", "timeout wakeups", timeout_wakeups);
+    serial::log_bool("ipc-wait", "cancellation Ring 3", cancellation_passed);
+    serial::log_u64("ipc-wait", "cancellation wakeups", cancellation_wakeups);
+    serial::log_bool("ipc-wait", "scheduler clean", scheduler_clean);
+    serial::log_bool("ipc-wait", "wait control test", passed);
+
+    IpcWaitControlReport {
+        timeout_ran,
+        timeout_exit_code,
+        timeout_wakeups,
+        cancellation_ran,
+        cancellation_exit_code,
+        cancellation_wakeups,
+        restart_completions,
+        scheduler_clean,
+        endpoint_clean,
+        frames_restored,
+        heap_restored,
+        resources_restored,
+        passed,
+    }
+}
+
 pub fn run_preemption_test() -> PreemptionReport {
     let frames_before = crate::physmem::snapshot();
     let heap_before = heap::snapshot();
@@ -2437,6 +2820,15 @@ pub fn state_name(state: TaskState) -> &'static str {
         TaskState::Running => "running",
         TaskState::Blocked => "blocked",
         TaskState::Exited => "exited",
+    }
+}
+
+pub fn ipc_wake_reason_name(reason: IpcWakeReason) -> &'static str {
+    match reason {
+        IpcWakeReason::None => "none",
+        IpcWakeReason::Message => "message",
+        IpcWakeReason::Timeout => "timeout",
+        IpcWakeReason::Cancelled => "cancelled",
     }
 }
 

@@ -20,7 +20,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 61] = [
+const COMMANDS: [Command; 62] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -260,6 +260,11 @@ const COMMANDS: [Command; 61] = [
         name: "captest",
         description: "uji izin revoke dan stale capability",
         handler: command_captest,
+    },
+    Command {
+        name: "ipcwait",
+        description: "uji timeout dan cancellation IPC",
+        handler: command_ipcwait,
     },
     Command {
         name: "gdt",
@@ -1179,7 +1184,7 @@ fn print_health_report() -> u64 {
         keyboard::pending_events() < 256,
         &mut issues,
     );
-    health_line("command table", COMMANDS.len() >= 61, &mut issues);
+    health_line("command table", COMMANDS.len() >= 62, &mut issues);
     health_line("last panic", !panic.present, &mut issues);
 
     issues
@@ -1310,7 +1315,7 @@ fn health_issue_count() -> u64 {
     );
     count_issue(ticks >= counters.shell_ready_tick, &mut issues);
     count_issue(keyboard::pending_events() < 256, &mut issues);
-    count_issue(COMMANDS.len() >= 61, &mut issues);
+    count_issue(COMMANDS.len() >= 62, &mut issues);
     count_issue(!panic.present, &mut issues);
 
     issues
@@ -2237,6 +2242,14 @@ fn print_task_rows() {
                 print_on_off(task.ipc_waiting);
                 print(" restart=");
                 print_on_off(task.ipc_restart_pending);
+                if task.ipc_deadline_tick != 0 {
+                    print(" deadline=");
+                    print_u64(task.ipc_deadline_tick);
+                }
+                if task.ipc_wake_reason != process::IpcWakeReason::None {
+                    print(" wake=");
+                    print(process::ipc_wake_reason_name(task.ipc_wake_reason));
+                }
             }
             newline();
         }
@@ -2382,8 +2395,12 @@ fn command_ipc(_arguments: &[u8]) {
     print_counter("cleanup revokes", snapshot.capabilities_revoked_on_cleanup);
     print_counter("cap denials", snapshot.capability_denials);
     print_counter("stale denials", snapshot.stale_capability_denials);
+    print_counter("cancel requests", snapshot.cancellation_requests);
+    print_counter("cancel success", snapshot.cancellation_successes);
     print_counter("blocking switches", scheduler_state.blocking_switches);
     print_counter("restart completions", process_state.ipc_restart_completions);
+    print_counter("timeout wakeups", process_state.ipc_timeouts);
+    print_counter("cancel wakeups", process_state.ipc_cancellations);
     print("  selftest         : ");
     print_on_off(ipc::selftest());
     newline();
@@ -2434,6 +2451,8 @@ fn command_capabilities(_arguments: &[u8]) {
     print_counter("cleanup revoked", snapshot.capabilities_revoked_on_cleanup);
     print_counter("denied", snapshot.capability_denials);
     print_counter("stale denied", snapshot.stale_capability_denials);
+    print_counter("cancel requests", snapshot.cancellation_requests);
+    print_counter("cancel success", snapshot.cancellation_successes);
     print_counter("last generation", snapshot.last_capability_generation);
 
     for task_index in 0..process::MAX_TASKS {
@@ -2491,6 +2510,45 @@ fn command_captest(_arguments: &[u8]) {
     newline();
     print("  cap baseline     : ");
     print_on_off(report.capability_baseline);
+    newline();
+    print("  frame baseline   : ");
+    print_on_off(report.frames_restored);
+    newline();
+    print("  heap baseline    : ");
+    print_on_off(report.heap_restored);
+    newline();
+    print("  resource baseline: ");
+    print_on_off(report.resources_restored);
+    newline();
+    print("  status           : ");
+    if report.passed {
+        println("PASS");
+    } else {
+        stats::inc_shell_error();
+        println("FAIL");
+    }
+}
+
+fn command_ipcwait(_arguments: &[u8]) {
+    println("IPC timeout and cancellation test:");
+    let report = process::run_ipc_wait_control_test();
+
+    print("  timeout Ring 3   : ");
+    print_on_off(report.timeout_ran);
+    newline();
+    print_counter("timeout exit", report.timeout_exit_code);
+    print_counter("timeout wakeups", report.timeout_wakeups);
+    print("  cancel Ring 3    : ");
+    print_on_off(report.cancellation_ran);
+    newline();
+    print_counter("cancel exit", report.cancellation_exit_code);
+    print_counter("cancel wakeups", report.cancellation_wakeups);
+    print_counter("restart complete", report.restart_completions);
+    print("  scheduler clean  : ");
+    print_on_off(report.scheduler_clean);
+    newline();
+    print("  endpoint clean   : ");
+    print_on_off(report.endpoint_clean);
     newline();
     print("  frame baseline   : ");
     print_on_off(report.frames_restored);
@@ -3165,7 +3223,7 @@ fn command_selftest(_arguments: &[u8]) {
     );
     selftest_check(
         "command table sane",
-        COMMANDS.len() >= 61,
+        COMMANDS.len() >= 62,
         &mut passed,
         &mut failed,
     );

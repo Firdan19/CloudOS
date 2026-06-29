@@ -283,6 +283,7 @@ fn run_command_table_checks() {
     check("command ipchandoff", shell::command_exists(b"ipchandoff"));
     check("command caps", shell::command_exists(b"caps"));
     check("command captest", shell::command_exists(b"captest"));
+    check("command ipcwait", shell::command_exists(b"ipcwait"));
     check("command tasks", shell::command_exists(b"tasks"));
     check("command sched", shell::command_exists(b"sched"));
     check("command preempt", shell::command_exists(b"preempt"));
@@ -504,7 +505,7 @@ fn run_selftest_checks() -> bool {
         "selftest keyboard queue sane",
         keyboard::pending_events() < 256,
     );
-    ok &= check("selftest command table sane", shell::command_count() >= 61);
+    ok &= check("selftest command table sane", shell::command_count() >= 62);
 
     ok
 }
@@ -794,6 +795,7 @@ fn run_ipc_checks() -> bool {
     let report = process::run_ipc_test();
     let handoff = process::run_ipc_handoff_test();
     let capability = process::run_capability_test();
+    let wait_control = process::run_ipc_wait_control_test();
     let ipc_after = ipc::snapshot();
     let scheduler_after = scheduler::snapshot();
     let mut ok = true;
@@ -854,6 +856,34 @@ fn run_ipc_checks() -> bool {
         capability.resources_restored,
     );
     ok &= check("ipc capability status", capability.passed);
+    ok &= check("ipc timeout Ring 3", wait_control.timeout_ran);
+    ok &= check(
+        "ipc timeout exit code",
+        wait_control.timeout_exit_code == 42,
+    );
+    ok &= check("ipc timeout wakeup", wait_control.timeout_wakeups == 1);
+    ok &= check("ipc cancellation Ring 3", wait_control.cancellation_ran);
+    ok &= check(
+        "ipc cancellation exit code",
+        wait_control.cancellation_exit_code == 42,
+    );
+    ok &= check(
+        "ipc cancellation wakeup",
+        wait_control.cancellation_wakeups == 1,
+    );
+    ok &= check(
+        "ipc wait restart completion",
+        wait_control.restart_completions == 2,
+    );
+    ok &= check("ipc wait scheduler clean", wait_control.scheduler_clean);
+    ok &= check("ipc wait endpoint clean", wait_control.endpoint_clean);
+    ok &= check("ipc wait frame baseline", wait_control.frames_restored);
+    ok &= check("ipc wait heap baseline", wait_control.heap_restored);
+    ok &= check(
+        "ipc wait resource baseline",
+        wait_control.resources_restored,
+    );
+    ok &= check("ipc wait control status", wait_control.passed);
     ok &= check(
         "ipc accounting",
         ipc_after.messages_sent >= ipc_before.messages_sent.saturating_add(15)

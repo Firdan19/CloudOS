@@ -397,8 +397,9 @@ unsafe fn send_eoi(irq: u8) {
 #[no_mangle]
 pub extern "C" fn timer_interrupt_handler(context: *mut TimerContext) -> u64 {
     stats::inc_timer_irq();
-    PIT_TICKS.fetch_add(1, Ordering::Relaxed);
+    let now = PIT_TICKS.fetch_add(1, Ordering::Relaxed).saturating_add(1);
     scheduler::on_timer_tick();
+    process::on_timer_tick(now);
     vga::toggle_cursor();
 
     let from_user = if context.is_null() {

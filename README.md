@@ -63,7 +63,8 @@ Proyek ini masih receh, tapi seru untuk dibangun bersama silahkan habiskan token
       Parent · child · wait · reaping<br>
       Bounded IPC mailboxes<br>
       Blocking syscall handoff<br>
-      Capability endpoint ber-generation
+      Capability endpoint ber-generation<br>
+      Receive timeout dan cancellation
     </td>
     <td width="25%" valign="top">
       <strong>Reliability</strong><br><br>
@@ -91,7 +92,7 @@ Proyek ini masih receh, tapi seru untuk dibangun bersama silahkan habiskan token
 | Sistem | Memory | Process | Debug dan Test |
 |---|---|---|---|
 | `help` `version` `about` `buildinfo` | `mem` `mmap` `frames` `paging` | `process` `tasks` `sched` `spawn` | `health` `diag` `log` `faults` |
-| `uptime` `ticks` `sysinfo` `boot` | `heap` `heapcheck` `virt` `vmtest` | `proctree` `waittest` `ipc` `ipctest` `ipchandoff` `caps` `captest` | `selftest` `stress` `preempt` `faulttest` |
+| `uptime` `ticks` `sysinfo` `boot` | `heap` `heapcheck` `virt` `vmtest` | `proctree` `waittest` `ipc` `ipctest` `ipchandoff` `caps` `captest` `ipcwait` | `selftest` `stress` `preempt` `faulttest` |
 
 Gunakan `help` di Tobacco untuk melihat seluruh command yang tersedia
 
@@ -117,7 +118,7 @@ QEMU dijalankan tanpa akses ke disk fisik
     <td><strong>Scheduling</strong><br>Preemptive context switch dan accounting yang lebih matang</td>
     <td><strong>Scheduler</strong><br>Context switch umum dan accounting per task</td>
     <td><strong>Isolation</strong><br>Fault policy per address space dan cleanup tahan gagal</td>
-    <td><strong>IPC</strong><br>Timeout receive dan transfer capability terkontrol</td>
+    <td><strong>IPC</strong><br>Transfer capability terkontrol dan rights attenuation</td>
   </tr>
 </table>
 
