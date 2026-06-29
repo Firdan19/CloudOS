@@ -20,7 +20,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 58] = [
+const COMMANDS: [Command; 59] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -245,6 +245,11 @@ const COMMANDS: [Command; 58] = [
         name: "ipctest",
         description: "uji message queue dan wakeup",
         handler: command_ipctest,
+    },
+    Command {
+        name: "ipchandoff",
+        description: "uji blocking IPC antarprocess Ring 3",
+        handler: command_ipchandoff,
     },
     Command {
         name: "gdt",
@@ -1163,7 +1168,7 @@ fn print_health_report() -> u64 {
         keyboard::pending_events() < 256,
         &mut issues,
     );
-    health_line("command table", COMMANDS.len() >= 58, &mut issues);
+    health_line("command table", COMMANDS.len() >= 59, &mut issues);
     health_line("last panic", !panic.present, &mut issues);
 
     issues
@@ -1293,7 +1298,7 @@ fn health_issue_count() -> u64 {
     );
     count_issue(ticks >= counters.shell_ready_tick, &mut issues);
     count_issue(keyboard::pending_events() < 256, &mut issues);
-    count_issue(COMMANDS.len() >= 58, &mut issues);
+    count_issue(COMMANDS.len() >= 59, &mut issues);
     count_issue(!panic.present, &mut issues);
 
     issues
@@ -1302,6 +1307,8 @@ fn health_issue_count() -> u64 {
 fn interrupt_abi_is_healthy(snapshot: interrupts::AbiSnapshot) -> bool {
     snapshot.idt_entry_bytes == 16
         && snapshot.exception_context_bytes == 40
+        && snapshot.timer_context_bytes == 192
+        && snapshot.syscall_frame_bytes == 160
         && snapshot.timer_gate_present
         && snapshot.keyboard_gate_present
         && snapshot.syscall_gate_present
@@ -1648,6 +1655,7 @@ fn command_idt(_arguments: &[u8]) {
     println("IDT/Interrupt ABI:");
     print_counter("idt entry bytes", abi.idt_entry_bytes);
     print_counter("timer ctx bytes", abi.timer_context_bytes);
+    print_counter("syscall frame", abi.syscall_frame_bytes);
     print_counter("exception ctx", abi.exception_context_bytes);
     print("  timer gate       : ");
     print_on_off(abi.timer_gate_present);
@@ -2212,6 +2220,12 @@ fn print_task_rows() {
                 print(" wait=");
                 print_u64(task.wait_target);
             }
+            if task.ipc_waiting || task.ipc_restart_pending {
+                print(" ipc=");
+                print_on_off(task.ipc_waiting);
+                print(" restart=");
+                print_on_off(task.ipc_restart_pending);
+            }
             newline();
         }
     }
@@ -2242,6 +2256,7 @@ fn command_scheduler(_arguments: &[u8]) {
     print_counter("maximum wait", snapshot.max_wait_ticks);
     print_counter("blocked tasks", snapshot.blocked_tasks);
     print_counter("block events", snapshot.block_events);
+    print_counter("blocking switches", snapshot.blocking_switches);
     print_counter("wake events", snapshot.wake_events);
     print_counter("failed wakeups", snapshot.failed_wakeups);
 }
@@ -2327,6 +2342,8 @@ fn command_syscall(_arguments: &[u8]) {
 
 fn command_ipc(_arguments: &[u8]) {
     let snapshot = ipc::snapshot();
+    let process_state = process::snapshot();
+    let scheduler_state = scheduler::snapshot();
 
     println("IPC bounded mailboxes:");
     print("  initialized      : ");
@@ -2346,9 +2363,46 @@ fn command_ipc(_arguments: &[u8]) {
     print_counter("receiver wakeups", snapshot.receiver_wakeups);
     print_counter("queue full", snapshot.queue_full_events);
     print_counter("cleanup drops", snapshot.dropped_on_cleanup);
+    print_counter("blocking switches", scheduler_state.blocking_switches);
+    print_counter("restart completions", process_state.ipc_restart_completions);
     print("  selftest         : ");
     print_on_off(ipc::selftest());
     newline();
+}
+
+fn command_ipchandoff(_arguments: &[u8]) {
+    println("IPC blocking handoff test:");
+    let report = process::run_ipc_handoff_test();
+
+    print_counter("sender task", report.sender_id);
+    print_counter("receiver task", report.receiver_id);
+    print_counter("exit code", report.exit_code);
+    print_counter("blocking switches", report.blocking_switches);
+    print_counter("restart completions", report.restart_completions);
+    print_counter("messages sent", report.messages_sent);
+    print_counter("messages received", report.messages_received);
+    print("  user execution   : ");
+    print_on_off(report.ran);
+    newline();
+    print("  endpoint cleanup : ");
+    print_on_off(report.endpoints_cleaned);
+    newline();
+    print("  frame baseline   : ");
+    print_on_off(report.frames_restored);
+    newline();
+    print("  heap baseline    : ");
+    print_on_off(report.heap_restored);
+    newline();
+    print("  resource baseline: ");
+    print_on_off(report.resources_restored);
+    newline();
+    print("  status           : ");
+    if report.passed {
+        println("PASS");
+    } else {
+        stats::inc_shell_error();
+        println("FAIL");
+    }
 }
 
 fn command_ipctest(_arguments: &[u8]) {
@@ -3004,7 +3058,7 @@ fn command_selftest(_arguments: &[u8]) {
     );
     selftest_check(
         "command table sane",
-        COMMANDS.len() >= 58,
+        COMMANDS.len() >= 59,
         &mut passed,
         &mut failed,
     );

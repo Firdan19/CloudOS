@@ -1,4 +1,4 @@
-use crate::{process, serial};
+use crate::{process, serial, user};
 use core::cell::UnsafeCell;
 use x86_64::instructions::interrupts as cpu_interrupts;
 
@@ -31,6 +31,12 @@ pub struct Delivery {
 pub enum ReceiveOutcome {
     Message(Delivery),
     Blocked,
+}
+
+#[derive(Clone, Copy)]
+pub enum SyscallBlockOutcome {
+    MessageReady,
+    Switched(u64),
 }
 
 #[derive(Clone, Copy)]
@@ -260,6 +266,13 @@ impl IpcState {
         Ok(())
     }
 
+    fn has_message(&self, task_id: u64) -> Result<bool, IpcError> {
+        let Some(index) = self.find(task_id) else {
+            return Err(IpcError::EndpointMissing);
+        };
+        Ok(self.endpoints[index].len != 0)
+    }
+
     fn find(&self, task_id: u64) -> Option<usize> {
         self.endpoints
             .iter()
@@ -374,6 +387,27 @@ pub fn receive(
             Ok(ReceiveOutcome::Blocked)
         }
         Err(error) => Err(error),
+    })
+}
+
+pub fn block_syscall(
+    receiver: u64,
+    frame: &mut user::SyscallFrame,
+) -> Result<SyscallBlockOutcome, IpcError> {
+    cpu_interrupts::without_interrupts(|| {
+        if state().has_message(receiver)? {
+            return Ok(SyscallBlockOutcome::MessageReady);
+        }
+
+        state_mut().set_waiting(receiver, true)?;
+        let Some(address_space_root) = process::block_for_ipc_syscall(receiver, frame) else {
+            let _ = state_mut().set_waiting(receiver, false);
+            return Err(IpcError::BlockFailed);
+        };
+
+        let state = state_mut();
+        state.blocked_receives = state.blocked_receives.saturating_add(1);
+        Ok(SyscallBlockOutcome::Switched(address_space_root))
     })
 }
 

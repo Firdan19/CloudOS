@@ -280,6 +280,7 @@ fn run_command_table_checks() {
     check("command waittest", shell::command_exists(b"waittest"));
     check("command ipc", shell::command_exists(b"ipc"));
     check("command ipctest", shell::command_exists(b"ipctest"));
+    check("command ipchandoff", shell::command_exists(b"ipchandoff"));
     check("command tasks", shell::command_exists(b"tasks"));
     check("command sched", shell::command_exists(b"sched"));
     check("command preempt", shell::command_exists(b"preempt"));
@@ -413,6 +414,7 @@ fn run_selftest_checks() -> bool {
         interrupt_abi.idt_entry_bytes == 16
             && interrupt_abi.exception_context_bytes == 40
             && interrupt_abi.timer_context_bytes == 192
+            && interrupt_abi.syscall_frame_bytes == 160
             && interrupt_abi.timer_gate_present
             && interrupt_abi.keyboard_gate_present
             && interrupt_abi.syscall_gate_present
@@ -498,7 +500,7 @@ fn run_selftest_checks() -> bool {
         "selftest keyboard queue sane",
         keyboard::pending_events() < 256,
     );
-    ok &= check("selftest command table sane", shell::command_count() >= 58);
+    ok &= check("selftest command table sane", shell::command_count() >= 59);
 
     ok
 }
@@ -786,6 +788,7 @@ fn run_ipc_checks() -> bool {
     let ipc_before = ipc::snapshot();
     let scheduler_before = scheduler::snapshot();
     let report = process::run_ipc_test();
+    let handoff = process::run_ipc_handoff_test();
     let ipc_after = ipc::snapshot();
     let scheduler_after = scheduler::snapshot();
     let mut ok = true;
@@ -802,10 +805,30 @@ fn run_ipc_checks() -> bool {
     ok &= check("ipc frame baseline", report.frames_restored);
     ok &= check("ipc heap baseline", report.heap_restored);
     ok &= check("ipc resource baseline", report.resources_restored);
+    ok &= check("ipc handoff user execution", handoff.ran);
+    ok &= check("ipc handoff exit code", handoff.exit_code == 42);
+    ok &= check(
+        "ipc handoff blocking switches",
+        handoff.blocking_switches == 5,
+    );
+    ok &= check(
+        "ipc handoff syscall restarts",
+        handoff.restart_completions == 4,
+    );
+    ok &= check("ipc handoff messages sent", handoff.messages_sent == 4);
+    ok &= check(
+        "ipc handoff messages received",
+        handoff.messages_received == 4,
+    );
+    ok &= check("ipc handoff endpoint cleanup", handoff.endpoints_cleaned);
+    ok &= check("ipc handoff frame baseline", handoff.frames_restored);
+    ok &= check("ipc handoff heap baseline", handoff.heap_restored);
+    ok &= check("ipc handoff resource baseline", handoff.resources_restored);
+    ok &= check("ipc handoff status", handoff.passed);
     ok &= check(
         "ipc accounting",
-        ipc_after.messages_sent >= ipc_before.messages_sent.saturating_add(10)
-            && ipc_after.messages_received >= ipc_before.messages_received.saturating_add(10)
+        ipc_after.messages_sent >= ipc_before.messages_sent.saturating_add(14)
+            && ipc_after.messages_received >= ipc_before.messages_received.saturating_add(14)
             && ipc_after.blocked_receives > ipc_before.blocked_receives
             && ipc_after.receiver_wakeups > ipc_before.receiver_wakeups
             && ipc_after.queue_full_events > ipc_before.queue_full_events,
@@ -814,6 +837,8 @@ fn run_ipc_checks() -> bool {
         "ipc scheduler wakeup",
         scheduler_after.block_events > scheduler_before.block_events
             && scheduler_after.wake_events > scheduler_before.wake_events
+            && scheduler_after.blocking_switches
+                >= scheduler_before.blocking_switches.saturating_add(5)
             && scheduler_after.blocked_tasks == scheduler_before.blocked_tasks,
     );
     ok &= check("ipc model selftest", ipc::selftest());

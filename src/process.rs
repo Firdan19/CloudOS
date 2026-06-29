@@ -9,6 +9,70 @@ const PREEMPT_TEST_SWITCHES: u64 = 8;
 const PREEMPT_TEST_EXIT_CODE: u64 = 0x5052;
 const SPIN_PROGRAM: [u8; 4] = [0xf3, 0x90, 0xeb, 0xfc];
 const MAX_USER_BUFFER_BYTES: u64 = 1024 * 1024;
+const SYSCALL_INSTRUCTION_BYTES: u64 = 2;
+const IPC_TEST_EXIT_CODE: u64 = 42;
+const IPC_TEST_DATA: u64 = paging::USER_ELF_BASE + paging::PAGE_SIZE_4K;
+const IPC_TEST_BUFFER: u64 = IPC_TEST_DATA + 64;
+const IPC_TEST_CODE_CAPACITY: usize = 512;
+
+struct UserCodeBuilder {
+    bytes: [u8; IPC_TEST_CODE_CAPACITY],
+    len: usize,
+    valid: bool,
+}
+
+impl UserCodeBuilder {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; IPC_TEST_CODE_CAPACITY],
+            len: 0,
+            valid: true,
+        }
+    }
+
+    fn byte(&mut self, value: u8) {
+        if self.len >= self.bytes.len() {
+            self.valid = false;
+            return;
+        }
+        self.bytes[self.len] = value;
+        self.len += 1;
+    }
+
+    fn bytes(&mut self, values: &[u8]) {
+        for value in values.iter().copied() {
+            self.byte(value);
+        }
+    }
+
+    fn mov_imm64(&mut self, opcode: u8, value: u64) {
+        self.bytes(&[0x48, opcode]);
+        self.bytes(&value.to_le_bytes());
+    }
+
+    fn syscall(&mut self, number: u64) {
+        self.mov_imm64(0xb8, number);
+        self.bytes(&[0xcd, 0x80]);
+    }
+
+    fn send(&mut self, peer: u64, data: u64) {
+        self.mov_imm64(0xbf, peer);
+        self.mov_imm64(0xbe, data);
+        self.mov_imm64(0xba, 4);
+        self.syscall(crate::syscall::SYSCALL_IPC_SEND);
+    }
+
+    fn receive(&mut self) {
+        self.mov_imm64(0xbf, IPC_TEST_BUFFER);
+        self.mov_imm64(0xbe, ipc::MAX_MESSAGE_BYTES as u64);
+        self.syscall(crate::syscall::SYSCALL_IPC_RECEIVE);
+    }
+
+    fn exit(&mut self, code: u64) {
+        self.mov_imm64(0xbf, code);
+        self.syscall(crate::syscall::SYSCALL_EXIT);
+    }
+}
 
 #[derive(Clone, Copy)]
 pub enum TimerAction {
@@ -53,6 +117,7 @@ pub struct Task {
     pub max_wait_ticks: u64,
     pub wait_target: u64,
     pub ipc_waiting: bool,
+    pub ipc_restart_pending: bool,
 }
 
 impl Task {
@@ -83,6 +148,7 @@ impl Task {
             max_wait_ticks: 0,
             wait_target: 0,
             ipc_waiting: false,
+            ipc_restart_pending: false,
         }
     }
 }
@@ -115,6 +181,8 @@ pub struct Snapshot {
     pub reaped_total: u64,
     pub wait_blocks: u64,
     pub parent_wakeups: u64,
+    pub ipc_blocking_switches: u64,
+    pub ipc_restart_completions: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -258,6 +326,23 @@ pub struct IpcTestReport {
     pub passed: bool,
 }
 
+#[derive(Clone, Copy)]
+pub struct IpcHandoffReport {
+    pub ran: bool,
+    pub sender_id: u64,
+    pub receiver_id: u64,
+    pub exit_code: u64,
+    pub blocking_switches: u64,
+    pub restart_completions: u64,
+    pub messages_sent: u64,
+    pub messages_received: u64,
+    pub endpoints_cleaned: bool,
+    pub frames_restored: bool,
+    pub heap_restored: bool,
+    pub resources_restored: bool,
+    pub passed: bool,
+}
+
 struct ProcessSlot {
     task: Task,
     address_space: paging::AddressSpace,
@@ -298,6 +383,8 @@ struct ProcessTable {
     reaped_total: u64,
     wait_blocks: u64,
     parent_wakeups: u64,
+    ipc_blocking_switches: u64,
+    ipc_restart_completions: u64,
     slots: [ProcessSlot; MAX_TASKS],
 }
 
@@ -325,6 +412,8 @@ impl ProcessTable {
             reaped_total: 0,
             wait_blocks: 0,
             parent_wakeups: 0,
+            ipc_blocking_switches: 0,
+            ipc_restart_completions: 0,
             slots: [const { ProcessSlot::empty() }; MAX_TASKS],
         }
     }
@@ -400,6 +489,8 @@ impl ProcessTable {
             reaped_total: self.reaped_total,
             wait_blocks: self.wait_blocks,
             parent_wakeups: self.parent_wakeups,
+            ipc_blocking_switches: self.ipc_blocking_switches,
+            ipc_restart_completions: self.ipc_restart_completions,
         }
     }
 
@@ -537,6 +628,64 @@ impl ProcessTable {
         task
     }
 
+    fn install_ipc_handoff_program(
+        &mut self,
+        task_id: u64,
+        peer_id: u64,
+        receiver_first: bool,
+    ) -> bool {
+        let Some(index) = self.find_task(task_id) else {
+            return false;
+        };
+        let entry_point = self.slots[index].task.entry_point;
+        let code = self.slots[index].address_space.translate(entry_point);
+        let data = self.slots[index].address_space.translate(IPC_TEST_DATA);
+        if !code.mapped
+            || !code.user_accessible
+            || !code.executable
+            || data.phys == 0
+            || !data.mapped
+            || !data.user_accessible
+            || !data.writable
+        {
+            return false;
+        }
+
+        let mut program = UserCodeBuilder::new();
+        if receiver_first {
+            program.receive();
+            program.send(peer_id, IPC_TEST_DATA);
+            program.receive();
+            program.send(peer_id, IPC_TEST_DATA + 4);
+            program.receive();
+            program.bytes(&[0xf4, 0xeb, 0xfd]);
+        } else {
+            program.send(peer_id, IPC_TEST_DATA);
+            program.receive();
+            program.send(peer_id, IPC_TEST_DATA + 4);
+            program.receive();
+            program.exit(IPC_TEST_EXIT_CODE);
+            program.bytes(&[0xf4, 0xeb, 0xfd]);
+        }
+        if !program.valid || program.len > paging::PAGE_SIZE_4K as usize {
+            return false;
+        }
+
+        unsafe {
+            let destination = code.phys as *mut u8;
+            core::ptr::write_bytes(destination, 0, paging::PAGE_SIZE_4K as usize);
+            for (offset, byte) in program.bytes[..program.len].iter().copied().enumerate() {
+                destination.add(offset).write_volatile(byte);
+            }
+
+            let data_destination = data.phys as *mut u8;
+            for (offset, byte) in b"pingpongdoneSTOP".iter().copied().enumerate() {
+                data_destination.add(offset).write_volatile(byte);
+            }
+        }
+        true
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn install_task(
         &mut self,
@@ -596,6 +745,7 @@ impl ProcessTable {
             max_wait_ticks: 0,
             wait_target: 0,
             ipc_waiting: false,
+            ipc_restart_pending: false,
         };
 
         self.slots[index] = ProcessSlot {
@@ -640,6 +790,8 @@ impl ProcessTable {
         self.slots[index].task.state = TaskState::Exited;
         self.slots[index].task.exit_code = exit_code;
         self.slots[index].task.syscalls_after = syscalls_after;
+        self.slots[index].task.ipc_waiting = false;
+        self.slots[index].task.ipc_restart_pending = false;
         self.exited_total = self.exited_total.saturating_add(1);
         self.last_task_id = id;
         self.last_exit_code = exit_code;
@@ -866,6 +1018,56 @@ impl ProcessTable {
         true
     }
 
+    fn block_for_ipc_syscall(
+        &mut self,
+        task_id: u64,
+        frame: &mut user::SyscallFrame,
+    ) -> Option<u64> {
+        let previous_index = self.find_task(task_id)?;
+        let previous = self.slots[previous_index].task;
+        if previous.state != TaskState::Running
+            || previous.wait_target != 0
+            || previous.ipc_waiting
+            || previous.ipc_restart_pending
+        {
+            return None;
+        }
+
+        save_syscall_context(&mut self.slots[previous_index].timer_context, frame, true);
+        self.slots[previous_index].context_valid = true;
+        let decision = scheduler::block_current_and_dispatch(task_id);
+        if !decision.switched || decision.previous_task != task_id {
+            return None;
+        }
+
+        let Some(next_index) = self.find_task(decision.next_task) else {
+            return None;
+        };
+        if !self.slots[next_index].context_valid
+            || self.slots[next_index].task.address_space_root == 0
+        {
+            return None;
+        }
+
+        self.slots[previous_index].task.state = TaskState::Blocked;
+        self.slots[previous_index].task.ipc_waiting = true;
+        self.slots[previous_index].task.ipc_restart_pending = true;
+
+        let next_task = &mut self.slots[next_index].task;
+        next_task.state = TaskState::Running;
+        next_task.runs = next_task.runs.saturating_add(1);
+        next_task.scheduled_slices = next_task.scheduled_slices.saturating_add(1);
+        next_task.last_scheduled_tick = interrupts::ticks();
+        next_task.max_wait_ticks = next_task.max_wait_ticks.max(decision.waited_ticks);
+
+        load_syscall_context(frame, &self.slots[next_index].timer_context);
+        self.ipc_blocking_switches = self.ipc_blocking_switches.saturating_add(1);
+        self.last_task_id = decision.next_task;
+        serial::log_u64("ipc", "blocking syscall switched from", task_id);
+        serial::log_u64("ipc", "blocking syscall switched to", decision.next_task);
+        Some(self.slots[next_index].task.address_space_root)
+    }
+
     fn wake_from_ipc(&mut self, task_id: u64) -> bool {
         let Some(index) = self.find_task(task_id) else {
             return false;
@@ -881,6 +1083,20 @@ impl ProcessTable {
         self.slots[index].task.state = TaskState::Ready;
         self.slots[index].task.ipc_waiting = false;
         serial::log_u64("ipc", "receiver woken", task_id);
+        true
+    }
+
+    fn complete_ipc_restart(&mut self, task_id: u64) -> bool {
+        let Some(index) = self.find_task(task_id) else {
+            return false;
+        };
+        if !self.slots[index].task.ipc_restart_pending {
+            return false;
+        }
+
+        self.slots[index].task.ipc_restart_pending = false;
+        self.ipc_restart_completions = self.ipc_restart_completions.saturating_add(1);
+        serial::log_u64("ipc", "blocking syscall resumed", task_id);
         true
     }
 
@@ -1143,8 +1359,16 @@ pub fn block_for_ipc(task_id: u64) -> bool {
     cpu_interrupts::without_interrupts(|| table_mut().block_for_ipc(task_id))
 }
 
+pub fn block_for_ipc_syscall(task_id: u64, frame: &mut user::SyscallFrame) -> Option<u64> {
+    cpu_interrupts::without_interrupts(|| table_mut().block_for_ipc_syscall(task_id, frame))
+}
+
 pub fn wake_from_ipc(task_id: u64) -> bool {
     cpu_interrupts::without_interrupts(|| table_mut().wake_from_ipc(task_id))
+}
+
+pub fn complete_ipc_restart(task_id: u64) -> bool {
+    cpu_interrupts::without_interrupts(|| table_mut().complete_ipc_restart(task_id))
 }
 
 pub fn run_user_probe_task() -> TaskRunResult {
@@ -1514,6 +1738,134 @@ pub fn run_ipc_test() -> IpcTestReport {
     }
 }
 
+pub fn run_ipc_handoff_test() -> IpcHandoffReport {
+    let frames_before = crate::physmem::snapshot();
+    let heap_before = heap::snapshot();
+    let resources_before = snapshot().active_resources;
+    let process_before = snapshot();
+    let ipc_before = ipc::snapshot();
+    let scheduler_before = scheduler::snapshot();
+    let receiver = cpu_interrupts::without_interrupts(|| table_mut().spawn_elf_init());
+    let sender = cpu_interrupts::without_interrupts(|| table_mut().spawn_elf_init());
+    let receiver_id = receiver.map(|task| task.id).unwrap_or(0);
+    let sender_id = sender.map(|task| task.id).unwrap_or(0);
+
+    let configured = if receiver_id != 0 && sender_id != 0 {
+        cpu_interrupts::without_interrupts(|| {
+            let table = table_mut();
+            table.install_ipc_handoff_program(receiver_id, sender_id, true)
+                && table.install_ipc_handoff_program(sender_id, receiver_id, false)
+        })
+    } else {
+        false
+    };
+
+    let mut ran = false;
+    let mut exit_code = 0;
+    let mut user_passed = false;
+    if configured {
+        let syscalls_before = user::snapshot().syscall_count;
+        let running = cpu_interrupts::without_interrupts(|| {
+            table_mut().mark_running(receiver_id, syscalls_before)
+        });
+        if running {
+            let result = user::run_program_in_address_space(
+                receiver.map(|task| task.entry_point).unwrap_or(0),
+                receiver.map(|task| task.stack_top).unwrap_or(0),
+                IPC_TEST_EXIT_CODE,
+                14,
+                receiver.map(|task| task.address_space_root).unwrap_or(0),
+            );
+            ran = result.ran;
+            exit_code = result.exit_code;
+            user_passed = result.passed;
+        }
+    }
+
+    let process_after_run = snapshot();
+    let ipc_after_run = ipc::snapshot();
+    let scheduler_after_run = scheduler::snapshot();
+    let blocking_switches = scheduler_after_run
+        .blocking_switches
+        .saturating_sub(scheduler_before.blocking_switches);
+    let restart_completions = process_after_run
+        .ipc_restart_completions
+        .saturating_sub(process_before.ipc_restart_completions);
+    let messages_sent = ipc_after_run
+        .messages_sent
+        .saturating_sub(ipc_before.messages_sent);
+    let messages_received = ipc_after_run
+        .messages_received
+        .saturating_sub(ipc_before.messages_received);
+    let handoff_complete = blocking_switches == 5
+        && restart_completions == 4
+        && messages_sent == 4
+        && messages_received == 4
+        && ipc_after_run.receiver_wakeups >= ipc_before.receiver_wakeups.saturating_add(4);
+
+    let syscalls = user::snapshot().syscall_count;
+    if receiver_id != 0 {
+        cpu_interrupts::without_interrupts(|| {
+            let _ = table_mut().mark_exited(receiver_id, 0, syscalls);
+            let _ = table_mut().cleanup_task(receiver_id);
+        });
+    }
+    if sender_id != 0 {
+        cpu_interrupts::without_interrupts(|| {
+            let _ = table_mut().mark_exited(sender_id, exit_code, syscalls);
+            let _ = table_mut().cleanup_task(sender_id);
+        });
+    }
+
+    let frames_after = crate::physmem::snapshot();
+    let heap_after = heap::snapshot();
+    let resources_after = snapshot().active_resources;
+    let ipc_after = ipc::snapshot();
+    let endpoints_cleaned = ipc_after.active_endpoints == ipc_before.active_endpoints
+        && ipc_after.queued_messages == ipc_before.queued_messages
+        && ipc_after.waiting_receivers == ipc_before.waiting_receivers;
+    let frames_restored = frames_after.allocated_frames == frames_before.allocated_frames
+        && frames_after.free_frames == frames_before.free_frames;
+    let heap_restored = heap_after.active_allocations == heap_before.active_allocations
+        && heap_after.allocated_bytes == heap_before.allocated_bytes
+        && heap_after.free_bytes == heap_before.free_bytes
+        && heap_after.metadata_ok
+        && heap_after.sentinel_ok
+        && heap_after.allocation_canaries_ok;
+    let resources_restored = resources_after == resources_before;
+    let passed = ran
+        && user_passed
+        && exit_code == IPC_TEST_EXIT_CODE
+        && handoff_complete
+        && endpoints_cleaned
+        && frames_restored
+        && heap_restored
+        && resources_restored;
+
+    serial::log_bool("ipc", "blocking handoff ran", ran);
+    serial::log_u64("ipc", "blocking switches", blocking_switches);
+    serial::log_u64("ipc", "restart completions", restart_completions);
+    serial::log_u64("ipc", "handoff messages sent", messages_sent);
+    serial::log_u64("ipc", "handoff messages received", messages_received);
+    serial::log_bool("ipc", "blocking handoff test", passed);
+
+    IpcHandoffReport {
+        ran,
+        sender_id,
+        receiver_id,
+        exit_code,
+        blocking_switches,
+        restart_completions,
+        messages_sent,
+        messages_received,
+        endpoints_cleaned,
+        frames_restored,
+        heap_restored,
+        resources_restored,
+        passed,
+    }
+}
+
 pub fn run_preemption_test() -> PreemptionReport {
     let frames_before = crate::physmem::snapshot();
     let heap_before = heap::snapshot();
@@ -1762,6 +2114,130 @@ pub fn selftest() -> bool {
         && user::probe_expected_exit_code() == 42
         && elf::selftest()
         && ipc::selftest()
+        && syscall_context_selftest()
+}
+
+fn syscall_context_selftest() -> bool {
+    let source = user::SyscallFrame {
+        r15: 15,
+        r14: 14,
+        r13: 13,
+        r12: 12,
+        r11: 11,
+        r10: 10,
+        r9: 9,
+        r8: 8,
+        rbp: 7,
+        rdi: 6,
+        rsi: 5,
+        rdx: 4,
+        rcx: 3,
+        rbx: 2,
+        rax: crate::syscall::SYSCALL_IPC_RECEIVE,
+        rip: 0x4010_0080,
+        cs: gdt::USER_CODE_SELECTOR as u64,
+        rflags: 0x202,
+        rsp: paging::USER_ELF_STACK_TOP,
+        ss: gdt::USER_DATA_SELECTOR as u64,
+    };
+    let mut context = interrupts::TimerContext::empty();
+    save_syscall_context(&mut context, &source, true);
+    let mut restored = user::SyscallFrame {
+        r15: 0,
+        r14: 0,
+        r13: 0,
+        r12: 0,
+        r11: 0,
+        r10: 0,
+        r9: 0,
+        r8: 0,
+        rbp: 0,
+        rdi: 0,
+        rsi: 0,
+        rdx: 0,
+        rcx: 0,
+        rbx: 0,
+        rax: 0,
+        rip: 0,
+        cs: 0,
+        rflags: 0,
+        rsp: 0,
+        ss: 0,
+    };
+    load_syscall_context(&mut restored, &context);
+
+    context.instruction_pointer == source.rip - SYSCALL_INSTRUCTION_BYTES
+        && restored.r15 == source.r15
+        && restored.r12 == source.r12
+        && restored.rdi == source.rdi
+        && restored.rsi == source.rsi
+        && restored.rdx == source.rdx
+        && restored.rcx == source.rcx
+        && restored.rax == source.rax
+        && restored.rip == source.rip - SYSCALL_INSTRUCTION_BYTES
+        && restored.cs == source.cs
+        && restored.rflags == source.rflags
+        && restored.rsp == source.rsp
+        && restored.ss == source.ss
+}
+
+fn save_syscall_context(
+    context: &mut interrupts::TimerContext,
+    frame: &user::SyscallFrame,
+    restart_syscall: bool,
+) {
+    let user_data = gdt::USER_DATA_SELECTOR as u64;
+    context.gs = user_data;
+    context.fs = user_data;
+    context.es = user_data;
+    context.ds = user_data;
+    context.r15 = frame.r15;
+    context.r14 = frame.r14;
+    context.r13 = frame.r13;
+    context.r12 = frame.r12;
+    context.r11 = frame.r11;
+    context.r10 = frame.r10;
+    context.r9 = frame.r9;
+    context.r8 = frame.r8;
+    context.rbp = frame.rbp;
+    context.rdi = frame.rdi;
+    context.rsi = frame.rsi;
+    context.rdx = frame.rdx;
+    context.rcx = frame.rcx;
+    context.rbx = frame.rbx;
+    context.rax = frame.rax;
+    context.instruction_pointer = if restart_syscall {
+        frame.rip.saturating_sub(SYSCALL_INSTRUCTION_BYTES)
+    } else {
+        frame.rip
+    };
+    context.code_segment = frame.cs;
+    context.cpu_flags = frame.rflags;
+    context.stack_pointer = frame.rsp;
+    context.stack_segment = frame.ss;
+}
+
+fn load_syscall_context(frame: &mut user::SyscallFrame, context: &interrupts::TimerContext) {
+    frame.r15 = context.r15;
+    frame.r14 = context.r14;
+    frame.r13 = context.r13;
+    frame.r12 = context.r12;
+    frame.r11 = context.r11;
+    frame.r10 = context.r10;
+    frame.r9 = context.r9;
+    frame.r8 = context.r8;
+    frame.rbp = context.rbp;
+    frame.rdi = context.rdi;
+    frame.rsi = context.rsi;
+    frame.rdx = context.rdx;
+    frame.rcx = context.rcx;
+    frame.rbx = context.rbx;
+    frame.rax = context.rax;
+    frame.rip = context.instruction_pointer;
+    frame.cs = context.code_segment;
+    frame.rflags = context.cpu_flags;
+    frame.rsp = context.stack_pointer;
+    frame.ss = context.stack_segment;
 }
 
 fn initial_timer_context(entry_point: u64, stack_top: u64) -> interrupts::TimerContext {

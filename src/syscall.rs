@@ -14,7 +14,29 @@ pub const RET_UNKNOWN_SYSCALL: u64 = u64::MAX;
 pub const RET_INVALID_USER_BUFFER: u64 = u64::MAX - 1;
 pub const RET_IPC_ERROR_BASE: u64 = u64::MAX - 32;
 
-type SyscallHandler = fn(u64, &mut user::SyscallFrame) -> u64;
+type SyscallHandler = fn(u64, &mut user::SyscallFrame) -> SyscallOutcome;
+
+#[derive(Clone, Copy)]
+struct SyscallOutcome {
+    return_value: u64,
+    switch_root: u64,
+}
+
+impl SyscallOutcome {
+    const fn complete(return_value: u64) -> Self {
+        Self {
+            return_value,
+            switch_root: 0,
+        }
+    }
+
+    const fn switch(switch_root: u64) -> Self {
+        Self {
+            return_value: RET_OK,
+            switch_root,
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ReturnCode {
@@ -115,7 +137,7 @@ pub fn init() -> Snapshot {
     snapshot()
 }
 
-pub fn dispatch(number: u64, arg0: u64, frame: &mut user::SyscallFrame) {
+pub fn dispatch(number: u64, arg0: u64, frame: &mut user::SyscallFrame) -> u64 {
     user::record_syscall();
     stats::inc_syscall();
 
@@ -127,7 +149,7 @@ pub fn dispatch(number: u64, arg0: u64, frame: &mut user::SyscallFrame) {
         LAST_RETURN.store(RET_UNKNOWN_SYSCALL, Ordering::Release);
         serial::log_u64("syscall", "unknown syscall", number);
         frame.rax = RET_UNKNOWN_SYSCALL;
-        return;
+        return 0;
     };
 
     if entry.logging {
@@ -138,15 +160,20 @@ pub fn dispatch(number: u64, arg0: u64, frame: &mut user::SyscallFrame) {
         LAST_RETURN.store(RET_OK, Ordering::Release);
     }
 
-    let return_value = (entry.handler)(arg0, frame);
-    LAST_RETURN.store(return_value, Ordering::Release);
+    let outcome = (entry.handler)(arg0, frame);
+    LAST_RETURN.store(outcome.return_value, Ordering::Release);
+    if outcome.switch_root != 0 {
+        serial::log_hex_u64("syscall", "context switch root", outcome.switch_root);
+        return outcome.switch_root;
+    }
     if entry.return_code != ReturnCode::Never {
-        frame.rax = return_value;
+        frame.rax = outcome.return_value;
     }
 
     if entry.logging && entry.return_code != ReturnCode::Never {
-        serial::log_u64("syscall", "return", return_value);
+        serial::log_u64("syscall", "return", outcome.return_value);
     }
+    0
 }
 
 pub fn snapshot() -> Snapshot {
@@ -204,82 +231,92 @@ pub fn return_code_name(code: ReturnCode) -> &'static str {
     }
 }
 
-fn syscall_log(arg0: u64, frame: &mut user::SyscallFrame) -> u64 {
+fn syscall_log(arg0: u64, frame: &mut user::SyscallFrame) -> SyscallOutcome {
     serial::log_u64("syscall", "user log id", arg0);
     frame.rax = RET_OK;
-    RET_OK
+    SyscallOutcome::complete(RET_OK)
 }
 
-fn syscall_uptime(_arg0: u64, frame: &mut user::SyscallFrame) -> u64 {
+fn syscall_uptime(_arg0: u64, frame: &mut user::SyscallFrame) -> SyscallOutcome {
     let ticks = interrupts::ticks();
     user::record_uptime_return(ticks);
     serial::log_u64("syscall", "uptime ticks", ticks);
     frame.rax = ticks;
-    ticks
+    SyscallOutcome::complete(ticks)
 }
 
-fn syscall_exit(arg0: u64, _frame: &mut user::SyscallFrame) -> u64 {
+fn syscall_exit(arg0: u64, _frame: &mut user::SyscallFrame) -> SyscallOutcome {
     serial::log_u64("syscall", "exit", arg0);
     unsafe { user::exit_to_kernel(arg0) }
 }
 
-fn syscall_yield(_arg0: u64, frame: &mut user::SyscallFrame) -> u64 {
+fn syscall_yield(_arg0: u64, frame: &mut user::SyscallFrame) -> SyscallOutcome {
     let current = scheduler::yield_current();
     serial::log_u64("syscall", "yield", current);
     frame.rax = RET_OK;
-    RET_OK
+    SyscallOutcome::complete(RET_OK)
 }
 
-fn syscall_ipc_send(receiver: u64, frame: &mut user::SyscallFrame) -> u64 {
+fn syscall_ipc_send(receiver: u64, frame: &mut user::SyscallFrame) -> SyscallOutcome {
     let sender = scheduler::snapshot().current_task;
     let length = frame.rdx as usize;
     if sender == 0 || length > ipc::MAX_MESSAGE_BYTES {
-        return ipc_error_return(ipc::IpcError::InvalidTask);
+        return SyscallOutcome::complete(ipc_error_return(ipc::IpcError::InvalidTask));
     }
 
     let mut message = [0u8; ipc::MAX_MESSAGE_BYTES];
     if !process::copy_from_user(sender, frame.rsi, &mut message[..length]) {
-        return RET_INVALID_USER_BUFFER;
+        return SyscallOutcome::complete(RET_INVALID_USER_BUFFER);
     }
     match ipc::send(sender, receiver, &message[..length]) {
         Ok(sequence) => {
             serial::log_u64("ipc", "syscall send bytes", length as u64);
             frame.rax = sequence;
-            sequence
+            SyscallOutcome::complete(sequence)
         }
-        Err(error) => ipc_error_return(error),
+        Err(error) => SyscallOutcome::complete(ipc_error_return(error)),
     }
 }
 
-fn syscall_ipc_receive(buffer: u64, frame: &mut user::SyscallFrame) -> u64 {
+fn syscall_ipc_receive(buffer: u64, frame: &mut user::SyscallFrame) -> SyscallOutcome {
     let receiver = scheduler::snapshot().current_task;
     let capacity = (frame.rsi as usize).min(ipc::MAX_MESSAGE_BYTES);
     if receiver == 0 {
-        return ipc_error_return(ipc::IpcError::InvalidTask);
+        return SyscallOutcome::complete(ipc_error_return(ipc::IpcError::InvalidTask));
     }
     if !process::validate_user_buffer(receiver, buffer, capacity as u64, true).valid {
-        return RET_INVALID_USER_BUFFER;
+        return SyscallOutcome::complete(RET_INVALID_USER_BUFFER);
     }
 
     let mut message = [0u8; ipc::MAX_MESSAGE_BYTES];
     match ipc::receive(receiver, &mut message[..capacity], false) {
         Ok(ipc::ReceiveOutcome::Message(delivery)) => {
             if !process::copy_to_user(receiver, buffer, &message[..delivery.length as usize]) {
-                return RET_INVALID_USER_BUFFER;
+                return SyscallOutcome::complete(RET_INVALID_USER_BUFFER);
             }
             frame.rdx = delivery.sender;
             frame.rcx = delivery.sequence;
             frame.rax = delivery.length;
             serial::log_u64("ipc", "syscall receive bytes", delivery.length);
-            delivery.length
+            let _ = process::complete_ipc_restart(receiver);
+            SyscallOutcome::complete(delivery.length)
         }
-        Ok(ipc::ReceiveOutcome::Blocked) => ipc_error_return(ipc::IpcError::BlockFailed),
-        Err(error) => ipc_error_return(error),
+        Ok(ipc::ReceiveOutcome::Blocked) => {
+            SyscallOutcome::complete(ipc_error_return(ipc::IpcError::BlockFailed))
+        }
+        Err(ipc::IpcError::QueueEmpty) => match ipc::block_syscall(receiver, frame) {
+            Ok(ipc::SyscallBlockOutcome::Switched(address_space_root)) => {
+                SyscallOutcome::switch(address_space_root)
+            }
+            Ok(ipc::SyscallBlockOutcome::MessageReady) => syscall_ipc_receive(buffer, frame),
+            Err(error) => SyscallOutcome::complete(ipc_error_return(error)),
+        },
+        Err(error) => SyscallOutcome::complete(ipc_error_return(error)),
     }
 }
 
-fn syscall_getpid(_arg0: u64, _frame: &mut user::SyscallFrame) -> u64 {
-    scheduler::snapshot().current_task
+fn syscall_getpid(_arg0: u64, _frame: &mut user::SyscallFrame) -> SyscallOutcome {
+    SyscallOutcome::complete(scheduler::snapshot().current_task)
 }
 
 pub fn ipc_error_return(error: ipc::IpcError) -> u64 {

@@ -27,6 +27,7 @@ pub struct Snapshot {
     pub max_wait_ticks: u64,
     pub blocked_tasks: u64,
     pub block_events: u64,
+    pub blocking_switches: u64,
     pub wake_events: u64,
     pub failed_wakeups: u64,
 }
@@ -89,6 +90,7 @@ struct Scheduler {
     starvation_preventions: u64,
     max_wait_ticks: u64,
     block_events: u64,
+    blocking_switches: u64,
     wake_events: u64,
     failed_wakeups: u64,
 }
@@ -117,6 +119,7 @@ impl Scheduler {
             starvation_preventions: 0,
             max_wait_ticks: 0,
             block_events: 0,
+            blocking_switches: 0,
             wake_events: 0,
             failed_wakeups: 0,
         }
@@ -159,6 +162,7 @@ impl Scheduler {
             max_wait_ticks: self.max_wait_ticks,
             blocked_tasks: self.blocked_len as u64,
             block_events: self.block_events,
+            blocking_switches: self.blocking_switches,
             wake_events: self.wake_events,
             failed_wakeups: self.failed_wakeups,
         }
@@ -259,6 +263,46 @@ impl Scheduler {
         self.blocked_len += 1;
         self.block_events = self.block_events.saturating_add(1);
         true
+    }
+
+    fn block_current_and_dispatch(&mut self, task_id: u64) -> PreemptionDecision {
+        if !self.initialized
+            || task_id == 0
+            || self.current_task != task_id
+            || self.len == 0
+            || self.blocked_len >= QUEUE_CAPACITY
+        {
+            return PreemptionDecision::none(self.current_task);
+        }
+
+        let (offset, starvation_guard) = self.select_next_offset();
+        let next = self.remove_at(offset);
+        if next.task_id == 0 {
+            return PreemptionDecision::none(self.current_task);
+        }
+
+        let waited_ticks = self.timer_ticks.saturating_sub(next.ready_since);
+        self.max_wait_ticks = self.max_wait_ticks.max(waited_ticks);
+        self.blocked[self.blocked_len] = task_id;
+        self.blocked_len += 1;
+        self.current_task = next.task_id;
+        self.last_task = next.task_id;
+        self.context_switches = self.context_switches.saturating_add(1);
+        self.block_events = self.block_events.saturating_add(1);
+        self.blocking_switches = self.blocking_switches.saturating_add(1);
+        if starvation_guard {
+            self.starvation_preventions = self.starvation_preventions.saturating_add(1);
+        }
+        self.last_switch_tick = self.timer_ticks;
+        self.slice_ticks = 0;
+
+        PreemptionDecision {
+            switched: true,
+            previous_task: task_id,
+            next_task: next.task_id,
+            waited_ticks,
+            starvation_guard,
+        }
     }
 
     fn wake_task(&mut self, task_id: u64) -> bool {
@@ -516,6 +560,14 @@ fn model_selftest() -> bool {
     let woke = blocking.wake_task(11);
     let wake_snapshot = blocking.snapshot();
 
+    let mut handoff = Scheduler::new();
+    handoff.initialized = true;
+    handoff.current_task = 20;
+    let handoff_queued = handoff.enqueue_at(21, 0) && handoff.enqueue_at(22, 0);
+    let handoff_decision = handoff.block_current_and_dispatch(20);
+    let handoff_snapshot = handoff.snapshot();
+    let handoff_woke = handoff.wake_task(20);
+
     queued
         && first.switched
         && first.previous_task == 1
@@ -538,6 +590,14 @@ fn model_selftest() -> bool {
         && wake_snapshot.queued_tasks == 1
         && wake_snapshot.block_events == 1
         && wake_snapshot.wake_events == 1
+        && handoff_queued
+        && handoff_decision.switched
+        && handoff_decision.previous_task == 20
+        && handoff_decision.next_task == 21
+        && handoff_snapshot.current_task == 21
+        && handoff_snapshot.blocked_tasks == 1
+        && handoff_snapshot.blocking_switches == 1
+        && handoff_woke
 }
 
 struct SchedulerStore {
@@ -577,6 +637,10 @@ pub fn yield_current() -> u64 {
 
 pub fn block_task(task_id: u64) -> bool {
     cpu_interrupts::without_interrupts(|| scheduler_mut().block_task(task_id))
+}
+
+pub fn block_current_and_dispatch(task_id: u64) -> PreemptionDecision {
+    cpu_interrupts::without_interrupts(|| scheduler_mut().block_current_and_dispatch(task_id))
 }
 
 pub fn wake_task(task_id: u64) -> bool {

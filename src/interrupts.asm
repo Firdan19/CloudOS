@@ -178,7 +178,12 @@ syscall_interrupt_stub:
     mov [rsp], rax
     cld
     call syscall_dispatch_handler
+    mov r11, rax
     mov rsp, [rsp]
+    test r11, r11
+    jz .restore_context
+    mov cr3, r11
+.restore_context:
     restore_segments
     pop_regs
     iretq

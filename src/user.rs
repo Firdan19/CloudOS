@@ -1,4 +1,5 @@
 use crate::{gdt, interrupts, paging, serial, stats, syscall};
+use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use x86_64::instructions::interrupts as cpu_interrupts;
 
@@ -74,6 +75,15 @@ pub struct SyscallFrame {
     pub rsp: u64,
     pub ss: u64,
 }
+
+const _: [(); 160] = [(); size_of::<SyscallFrame>()];
+const _: [(); 72] = [(); core::mem::offset_of!(SyscallFrame, rdi)];
+const _: [(); 112] = [(); core::mem::offset_of!(SyscallFrame, rax)];
+const _: [(); 120] = [(); core::mem::offset_of!(SyscallFrame, rip)];
+const _: [(); 128] = [(); core::mem::offset_of!(SyscallFrame, cs)];
+const _: [(); 136] = [(); core::mem::offset_of!(SyscallFrame, rflags)];
+const _: [(); 144] = [(); core::mem::offset_of!(SyscallFrame, rsp)];
+const _: [(); 152] = [(); core::mem::offset_of!(SyscallFrame, ss)];
 
 static USER_READY: AtomicBool = AtomicBool::new(false);
 static USER_CODE_MAPPED: AtomicBool = AtomicBool::new(false);
@@ -290,9 +300,13 @@ pub unsafe fn exit_to_kernel(exit_code: u64) -> ! {
 }
 
 #[no_mangle]
-pub extern "C" fn syscall_dispatch_handler(number: u64, arg0: u64, frame: *mut SyscallFrame) {
+pub extern "C" fn syscall_dispatch_handler(
+    number: u64,
+    arg0: u64,
+    frame: *mut SyscallFrame,
+) -> u64 {
     let frame = unsafe { &mut *frame };
-    syscall::dispatch(number, arg0, frame);
+    syscall::dispatch(number, arg0, frame)
 }
 
 fn write_probe_program() {
