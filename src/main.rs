@@ -12,6 +12,7 @@ mod gdt;
 mod heap;
 mod initramfs;
 mod interrupts;
+mod ipc;
 mod keyboard;
 mod klog;
 mod multiboot;
@@ -197,6 +198,7 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info_addr: u32) ->
     serial::log_u64("heap", "heap bytes", heap_state.size);
     user::init();
     elf::init();
+    ipc::init();
     process::init();
     scheduler::init();
     syscall::init();

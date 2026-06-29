@@ -1,6 +1,6 @@
 use crate::{
-    elf, gdt, heap, initramfs, interrupts, keyboard, klog, multiboot, paging, physmem, process,
-    scheduler, serial, shell, stats, syscall, user, user_program, vga,
+    elf, gdt, heap, initramfs, interrupts, ipc, keyboard, klog, multiboot, paging, physmem,
+    process, scheduler, serial, shell, stats, syscall, user, user_program, vga,
 };
 use x86_64::instructions::hlt;
 
@@ -13,6 +13,7 @@ const CI_HEAP_FLAG: &[u8] = b"tobacco.ci=heap";
 const CI_KEYBOARD_FLAG: &[u8] = b"tobacco.ci=keyboard";
 const CI_PREEMPT_FLAG: &[u8] = b"tobacco.ci=preempt";
 const CI_PROCESS_TREE_FLAG: &[u8] = b"tobacco.ci=proctree";
+const CI_IPC_FLAG: &[u8] = b"tobacco.ci=ipc";
 const CI_PAGE_FAULT_FLAG: &[u8] = b"tobacco.ci=pagefault";
 const CI_DOUBLE_FAULT_FLAG: &[u8] = b"tobacco.ci=doublefault";
 const VGA_BUFFER_ADDRESS: u64 = 0x000b_8000;
@@ -71,6 +72,11 @@ pub fn run_if_requested() {
 
         if contains_bytes(command_line, CI_PROCESS_TREE_FLAG) {
             run_process_tree_matrix();
+            return;
+        }
+
+        if contains_bytes(command_line, CI_IPC_FLAG) {
+            run_ipc_matrix();
             return;
         }
 
@@ -203,6 +209,17 @@ fn run_process_tree_matrix() {
     serial::log("ci", "process tree complete");
 }
 
+fn run_ipc_matrix() {
+    serial::log("ci", "ipc mailbox requested");
+    if run_ipc_checks() {
+        serial::log("ci", "ipc mailbox status: PASS");
+    } else {
+        serial::log("ci", "ipc mailbox status: FAIL");
+    }
+
+    serial::log("ci", "ipc mailbox complete");
+}
+
 fn trigger_page_fault_for_ci() -> ! {
     let target = paging::KERNEL_HEAP_GUARD_LOW;
     serial::log("ci-fault", "page fault trigger requested");
@@ -261,6 +278,8 @@ fn run_command_table_checks() {
     );
     check("command proctree", shell::command_exists(b"proctree"));
     check("command waittest", shell::command_exists(b"waittest"));
+    check("command ipc", shell::command_exists(b"ipc"));
+    check("command ipctest", shell::command_exists(b"ipctest"));
     check("command tasks", shell::command_exists(b"tasks"));
     check("command sched", shell::command_exists(b"sched"));
     check("command preempt", shell::command_exists(b"preempt"));
@@ -294,6 +313,7 @@ fn run_selftest_checks() -> bool {
     let address_spaces = paging::address_space_stats();
     let scheduler_state = scheduler::snapshot();
     let syscall_state = syscall::snapshot();
+    let ipc_state = ipc::snapshot();
     let user_state = user::snapshot();
     let elf_state = elf::snapshot();
     let initramfs_state = initramfs::snapshot();
@@ -455,6 +475,16 @@ fn run_selftest_checks() -> bool {
     );
     ok &= check("selftest syscall table model", syscall::selftest());
     ok &= check(
+        "selftest ipc mailbox ready",
+        ipc_state.initialized
+            && ipc_state.endpoint_capacity == ipc::MAX_ENDPOINTS as u64
+            && ipc_state.queue_depth == ipc::QUEUE_DEPTH as u64
+            && ipc_state.max_message_bytes == ipc::MAX_MESSAGE_BYTES as u64
+            && ipc_state.active_endpoints == 0
+            && ipc_state.queued_messages == 0
+            && ipc::selftest(),
+    );
+    ok &= check(
         "selftest kernel log ready",
         log.initialized && log.capacity == klog::ENTRY_COUNT as u64 && log.count > 0,
     );
@@ -468,7 +498,7 @@ fn run_selftest_checks() -> bool {
         "selftest keyboard queue sane",
         keyboard::pending_events() < 256,
     );
-    ok &= check("selftest command table sane", shell::command_count() >= 56);
+    ok &= check("selftest command table sane", shell::command_count() >= 58);
 
     ok
 }
@@ -749,6 +779,45 @@ fn run_process_tree_checks() -> bool {
             && scheduler_after.blocked_tasks == scheduler_before.blocked_tasks,
     );
     ok &= check("process tree status", report.passed);
+    ok
+}
+
+fn run_ipc_checks() -> bool {
+    let ipc_before = ipc::snapshot();
+    let scheduler_before = scheduler::snapshot();
+    let report = process::run_ipc_test();
+    let ipc_after = ipc::snapshot();
+    let scheduler_after = scheduler::snapshot();
+    let mut ok = true;
+
+    ok &= check("ipc sender endpoint", report.sender_id > 0);
+    ok &= check("ipc receiver endpoint", report.receiver_id > 0);
+    ok &= check("ipc queued delivery", report.queued_delivery);
+    ok &= check("ipc receiver blocked", report.receiver_blocked);
+    ok &= check("ipc receiver woken", report.receiver_woken);
+    ok &= check("ipc wake delivery", report.wake_delivery);
+    ok &= check("ipc fifo order", report.fifo_order);
+    ok &= check("ipc queue backpressure", report.backpressure);
+    ok &= check("ipc endpoint cleanup", report.endpoint_cleanup);
+    ok &= check("ipc frame baseline", report.frames_restored);
+    ok &= check("ipc heap baseline", report.heap_restored);
+    ok &= check("ipc resource baseline", report.resources_restored);
+    ok &= check(
+        "ipc accounting",
+        ipc_after.messages_sent >= ipc_before.messages_sent.saturating_add(10)
+            && ipc_after.messages_received >= ipc_before.messages_received.saturating_add(10)
+            && ipc_after.blocked_receives > ipc_before.blocked_receives
+            && ipc_after.receiver_wakeups > ipc_before.receiver_wakeups
+            && ipc_after.queue_full_events > ipc_before.queue_full_events,
+    );
+    ok &= check(
+        "ipc scheduler wakeup",
+        scheduler_after.block_events > scheduler_before.block_events
+            && scheduler_after.wake_events > scheduler_before.wake_events
+            && scheduler_after.blocked_tasks == scheduler_before.blocked_tasks,
+    );
+    ok &= check("ipc model selftest", ipc::selftest());
+    ok &= check("ipc status", report.passed);
     ok
 }
 

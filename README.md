@@ -18,7 +18,7 @@
     <td align="center"><strong>Version</strong><br><code>v0.0.5</code></td>
     <td align="center"><strong>Phase</strong><br>1 · Foundation</td>
     <td align="center"><strong>Architecture</strong><br><code>x86_64</code></td>
-    <td align="center"><strong>CI Matrix</strong><br>11 jobs</td>
+    <td align="center"><strong>CI Matrix</strong><br>12 jobs</td>
   </tr>
 </table>
 
@@ -60,7 +60,8 @@ Proyek ini masih receh, tapi seru untuk dibangun bersama silahkan habiskan token
       Private CR3 per process<br>
       Spawn · yield · exit<br>
       Preemptive round-robin<br>
-      Parent · child · wait · reaping
+      Parent · child · wait · reaping<br>
+      Bounded IPC mailboxes
     </td>
     <td width="25%" valign="top">
       <strong>Reliability</strong><br><br>
@@ -68,7 +69,7 @@ Proyek ini masih receh, tapi seru untuk dibangun bersama silahkan habiskan token
       User fault isolation<br>
       Serial dan kernel ring log<br>
       Selftest dan stress test<br>
-      11-job CI kernel matrix
+      12-job CI kernel matrix
     </td>
   </tr>
 </table>
@@ -88,7 +89,7 @@ Proyek ini masih receh, tapi seru untuk dibangun bersama silahkan habiskan token
 | Sistem | Memory | Process | Debug dan Test |
 |---|---|---|---|
 | `help` `version` `about` `buildinfo` | `mem` `mmap` `frames` `paging` | `process` `tasks` `sched` `spawn` | `health` `diag` `log` `faults` |
-| `uptime` `ticks` `sysinfo` `boot` | `heap` `heapcheck` `virt` `vmtest` | `lifecycle` `proctree` `waittest` `preempt` | `selftest` `stress` `consoletest` `faulttest` |
+| `uptime` `ticks` `sysinfo` `boot` | `heap` `heapcheck` `virt` `vmtest` | `proctree` `waittest` `ipc` `ipctest` | `selftest` `stress` `preempt` `faulttest` |
 
 Gunakan `help` di Tobacco untuk melihat seluruh command yang tersedia
 
@@ -114,7 +115,7 @@ QEMU dijalankan tanpa akses ke disk fisik
     <td><strong>Scheduling</strong><br>Preemptive context switch dan accounting yang lebih matang</td>
     <td><strong>Scheduler</strong><br>Context switch umum dan accounting per task</td>
     <td><strong>Isolation</strong><br>Fault policy per address space dan cleanup tahan gagal</td>
-    <td><strong>IPC</strong><br>Primitive komunikasi kernel yang kecil dan terukur</td>
+    <td><strong>IPC</strong><br>Blocking syscall handoff dan capability endpoint</td>
   </tr>
 </table>
 

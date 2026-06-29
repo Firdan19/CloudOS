@@ -1,7 +1,7 @@
 use crate::keyboard::{self, KeyEvent};
 use crate::{
-    buildinfo, elf, gdt, heap, initramfs, interrupts, klog, multiboot, paging, paniclog, physmem,
-    scheduler, serial, stats, user_program, vga,
+    buildinfo, elf, gdt, heap, initramfs, interrupts, ipc, klog, multiboot, paging, paniclog,
+    physmem, scheduler, serial, stats, user_program, vga,
 };
 use crate::{process, syscall, user};
 use x86_64::instructions::interrupts as cpu_interrupts;
@@ -20,7 +20,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 56] = [
+const COMMANDS: [Command; 58] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -235,6 +235,16 @@ const COMMANDS: [Command; 56] = [
         name: "syscalls",
         description: "alias untuk syscall",
         handler: command_syscall,
+    },
+    Command {
+        name: "ipc",
+        description: "status mailbox IPC kernel",
+        handler: command_ipc,
+    },
+    Command {
+        name: "ipctest",
+        description: "uji message queue dan wakeup",
+        handler: command_ipctest,
     },
     Command {
         name: "gdt",
@@ -1014,6 +1024,7 @@ fn print_health_report() -> u64 {
     let address_spaces = paging::address_space_stats();
     let scheduler_state = scheduler::snapshot();
     let syscall_state = syscall::snapshot();
+    let ipc_state = ipc::snapshot();
     let user_state = user::snapshot();
     let initramfs_state = initramfs::snapshot();
     let interrupt_abi = interrupts::abi_snapshot();
@@ -1128,6 +1139,15 @@ fn print_health_report() -> u64 {
         &mut issues,
     );
     health_line(
+        "ipc mailboxes",
+        ipc_state.initialized
+            && ipc_state.active_endpoints == 0
+            && ipc_state.queued_messages == 0
+            && ipc_state.waiting_receivers == 0
+            && ipc::selftest(),
+        &mut issues,
+    );
+    health_line(
         "kernel log",
         log.initialized && log.count <= log.capacity,
         &mut issues,
@@ -1143,7 +1163,7 @@ fn print_health_report() -> u64 {
         keyboard::pending_events() < 256,
         &mut issues,
     );
-    health_line("command table", COMMANDS.len() >= 56, &mut issues);
+    health_line("command table", COMMANDS.len() >= 58, &mut issues);
     health_line("last panic", !panic.present, &mut issues);
 
     issues
@@ -1164,6 +1184,7 @@ fn health_issue_count() -> u64 {
     let address_spaces = paging::address_space_stats();
     let scheduler_state = scheduler::snapshot();
     let syscall_state = syscall::snapshot();
+    let ipc_state = ipc::snapshot();
     let user_state = user::snapshot();
     let initramfs_state = initramfs::snapshot();
     let interrupt_abi = interrupts::abi_snapshot();
@@ -1257,6 +1278,14 @@ fn health_issue_count() -> u64 {
         syscall_state.initialized && syscall::selftest(),
         &mut issues,
     );
+    count_issue(
+        ipc_state.initialized
+            && ipc_state.active_endpoints == 0
+            && ipc_state.queued_messages == 0
+            && ipc_state.waiting_receivers == 0
+            && ipc::selftest(),
+        &mut issues,
+    );
     count_issue(log.initialized && log.count <= log.capacity, &mut issues);
     count_issue(
         counters.serial_bytes > 0 && counters.vga_cell_writes > 0,
@@ -1264,7 +1293,7 @@ fn health_issue_count() -> u64 {
     );
     count_issue(ticks >= counters.shell_ready_tick, &mut issues);
     count_issue(keyboard::pending_events() < 256, &mut issues);
-    count_issue(COMMANDS.len() >= 56, &mut issues);
+    count_issue(COMMANDS.len() >= 58, &mut issues);
     count_issue(!panic.present, &mut issues);
 
     issues
@@ -2296,6 +2325,77 @@ fn command_syscall(_arguments: &[u8]) {
     }
 }
 
+fn command_ipc(_arguments: &[u8]) {
+    let snapshot = ipc::snapshot();
+
+    println("IPC bounded mailboxes:");
+    print("  initialized      : ");
+    print_on_off(snapshot.initialized);
+    newline();
+    print_counter("endpoint capacity", snapshot.endpoint_capacity);
+    print_counter("active endpoints", snapshot.active_endpoints);
+    print_counter("queue depth", snapshot.queue_depth);
+    print_counter("message bytes", snapshot.max_message_bytes);
+    print_counter("queued messages", snapshot.queued_messages);
+    print_counter("waiting receivers", snapshot.waiting_receivers);
+    print_counter("endpoints created", snapshot.endpoints_created);
+    print_counter("endpoints destroyed", snapshot.endpoints_destroyed);
+    print_counter("messages sent", snapshot.messages_sent);
+    print_counter("messages received", snapshot.messages_received);
+    print_counter("blocked receives", snapshot.blocked_receives);
+    print_counter("receiver wakeups", snapshot.receiver_wakeups);
+    print_counter("queue full", snapshot.queue_full_events);
+    print_counter("cleanup drops", snapshot.dropped_on_cleanup);
+    print("  selftest         : ");
+    print_on_off(ipc::selftest());
+    newline();
+}
+
+fn command_ipctest(_arguments: &[u8]) {
+    println("IPC mailbox test:");
+    let report = process::run_ipc_test();
+
+    print_counter("sender task", report.sender_id);
+    print_counter("receiver task", report.receiver_id);
+    print("  queued delivery  : ");
+    print_on_off(report.queued_delivery);
+    newline();
+    print("  receiver blocked : ");
+    print_on_off(report.receiver_blocked);
+    newline();
+    print("  receiver woken   : ");
+    print_on_off(report.receiver_woken);
+    newline();
+    print("  wake delivery    : ");
+    print_on_off(report.wake_delivery);
+    newline();
+    print("  FIFO order       : ");
+    print_on_off(report.fifo_order);
+    newline();
+    print("  backpressure     : ");
+    print_on_off(report.backpressure);
+    newline();
+    print("  endpoint cleanup : ");
+    print_on_off(report.endpoint_cleanup);
+    newline();
+    print("  frame baseline   : ");
+    print_on_off(report.frames_restored);
+    newline();
+    print("  heap baseline    : ");
+    print_on_off(report.heap_restored);
+    newline();
+    print("  resource baseline: ");
+    print_on_off(report.resources_restored);
+    newline();
+    print("  status           : ");
+    if report.passed {
+        println("PASS");
+    } else {
+        stats::inc_shell_error();
+        println("FAIL");
+    }
+}
+
 fn command_gdt(_arguments: &[u8]) {
     let snapshot = gdt::snapshot();
 
@@ -2633,6 +2733,7 @@ fn command_selftest(_arguments: &[u8]) {
     let syscall_state = syscall::snapshot();
     let user_state = user::snapshot();
     let elf_state = elf::snapshot();
+    let ipc_state = ipc::snapshot();
     let initramfs_state = initramfs::snapshot();
     let interrupt_abi = interrupts::abi_snapshot();
 
@@ -2862,6 +2963,16 @@ fn command_selftest(_arguments: &[u8]) {
         &mut failed,
     );
     selftest_check(
+        "ipc mailbox ready",
+        ipc_state.initialized
+            && ipc_state.endpoint_capacity == ipc::MAX_ENDPOINTS as u64
+            && ipc_state.active_endpoints == 0
+            && ipc_state.queued_messages == 0
+            && ipc::selftest(),
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
         "kernel log ring ready",
         log.initialized && log.capacity == klog::ENTRY_COUNT as u64 && log.count > 0,
         &mut passed,
@@ -2893,7 +3004,7 @@ fn command_selftest(_arguments: &[u8]) {
     );
     selftest_check(
         "command table sane",
-        COMMANDS.len() >= 56,
+        COMMANDS.len() >= 58,
         &mut passed,
         &mut failed,
     );

@@ -1,4 +1,4 @@
-use crate::{elf, gdt, heap, interrupts, paging, scheduler, serial, user, user_program};
+use crate::{elf, gdt, heap, interrupts, ipc, paging, scheduler, serial, user, user_program};
 use core::cell::UnsafeCell;
 use x86_64::instructions::interrupts as cpu_interrupts;
 
@@ -52,6 +52,7 @@ pub struct Task {
     pub last_scheduled_tick: u64,
     pub max_wait_ticks: u64,
     pub wait_target: u64,
+    pub ipc_waiting: bool,
 }
 
 impl Task {
@@ -81,6 +82,7 @@ impl Task {
             last_scheduled_tick: 0,
             max_wait_ticks: 0,
             wait_target: 0,
+            ipc_waiting: false,
         }
     }
 }
@@ -237,6 +239,23 @@ pub struct UserBufferValidation {
     pub valid: bool,
     pub pages_checked: u64,
     pub writable: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct IpcTestReport {
+    pub sender_id: u64,
+    pub receiver_id: u64,
+    pub queued_delivery: bool,
+    pub receiver_blocked: bool,
+    pub receiver_woken: bool,
+    pub wake_delivery: bool,
+    pub fifo_order: bool,
+    pub backpressure: bool,
+    pub endpoint_cleanup: bool,
+    pub frames_restored: bool,
+    pub heap_restored: bool,
+    pub resources_restored: bool,
+    pub passed: bool,
 }
 
 struct ProcessSlot {
@@ -544,6 +563,13 @@ impl ProcessTable {
 
         let id = self.next_task_id;
         self.next_task_id = self.next_task_id.saturating_add(1);
+        if let Err(error) = ipc::register_endpoint(id) {
+            let mut address_space = address_space;
+            let _ = address_space.destroy();
+            self.failed_spawns = self.failed_spawns.saturating_add(1);
+            serial::log("process", ipc::error_name(error));
+            return None;
+        }
         let task = Task {
             id,
             parent_id,
@@ -569,6 +595,7 @@ impl ProcessTable {
             last_scheduled_tick: 0,
             max_wait_ticks: 0,
             wait_target: 0,
+            ipc_waiting: false,
         };
 
         self.slots[index] = ProcessSlot {
@@ -635,6 +662,7 @@ impl ProcessTable {
 
         let heap_address = self.slots[index].task.heap_allocation;
         let heap_released = heap_address != 0 && heap::free(heap_address).is_ok();
+        let endpoint_released = ipc::unregister_endpoint(id).is_ok();
         let cleanup = self.slots[index].address_space.destroy();
         let (user_frames, table_frames, pages_complete) = match cleanup {
             Ok(report) => (
@@ -647,7 +675,7 @@ impl ProcessTable {
                 (0, 0, false)
             }
         };
-        let complete = heap_released && pages_complete;
+        let complete = heap_released && endpoint_released && pages_complete;
 
         let task = &mut self.slots[index].task;
         task.cleanup_user_frames = user_frames;
@@ -817,6 +845,45 @@ impl ProcessTable {
         true
     }
 
+    fn block_for_ipc(&mut self, task_id: u64) -> bool {
+        let Some(index) = self.find_task(task_id) else {
+            return false;
+        };
+        let task = self.slots[index].task;
+        if !matches!(task.state, TaskState::Ready | TaskState::Running)
+            || task.wait_target != 0
+            || task.ipc_waiting
+        {
+            return false;
+        }
+        if !scheduler::block_task(task_id) {
+            return false;
+        }
+
+        self.slots[index].task.state = TaskState::Blocked;
+        self.slots[index].task.ipc_waiting = true;
+        serial::log_u64("ipc", "receiver blocked", task_id);
+        true
+    }
+
+    fn wake_from_ipc(&mut self, task_id: u64) -> bool {
+        let Some(index) = self.find_task(task_id) else {
+            return false;
+        };
+        if self.slots[index].task.state != TaskState::Blocked || !self.slots[index].task.ipc_waiting
+        {
+            return false;
+        }
+        if !scheduler::wake_task(task_id) {
+            return false;
+        }
+
+        self.slots[index].task.state = TaskState::Ready;
+        self.slots[index].task.ipc_waiting = false;
+        serial::log_u64("ipc", "receiver woken", task_id);
+        true
+    }
+
     fn find_child(&self, parent_id: u64, child_id: u64) -> Option<usize> {
         let mut first_match = None;
         for index in 0..MAX_TASKS {
@@ -910,6 +977,75 @@ impl ProcessTable {
         }
     }
 
+    fn copy_from_user(&self, task_id: u64, address: u64, output: &mut [u8]) -> bool {
+        if !self
+            .validate_user_buffer(task_id, address, output.len() as u64, false)
+            .valid
+        {
+            return false;
+        }
+        self.copy_user_bytes(task_id, address, output.as_mut_ptr(), output.len(), false)
+    }
+
+    fn copy_to_user(&self, task_id: u64, address: u64, input: &[u8]) -> bool {
+        if !self
+            .validate_user_buffer(task_id, address, input.len() as u64, true)
+            .valid
+        {
+            return false;
+        }
+        self.copy_user_bytes(
+            task_id,
+            address,
+            input.as_ptr() as *mut u8,
+            input.len(),
+            true,
+        )
+    }
+
+    fn copy_user_bytes(
+        &self,
+        task_id: u64,
+        address: u64,
+        buffer: *mut u8,
+        length: usize,
+        to_user: bool,
+    ) -> bool {
+        let Some(index) = self.find_task(task_id) else {
+            return false;
+        };
+        let mut copied = 0usize;
+        while copied < length {
+            let virtual_address = address.saturating_add(copied as u64);
+            let translation = self.slots[index].address_space.translate(virtual_address);
+            if !translation.mapped
+                || !translation.user_accessible
+                || (to_user && !translation.writable)
+            {
+                return false;
+            }
+            let page_offset = (virtual_address & (paging::PAGE_SIZE_4K - 1)) as usize;
+            let chunk = (paging::PAGE_SIZE_4K as usize - page_offset).min(length - copied);
+            unsafe {
+                if to_user {
+                    core::ptr::copy_nonoverlapping(
+                        buffer.add(copied) as *const u8,
+                        translation.phys as *mut u8,
+                        chunk,
+                    );
+                } else {
+                    core::ptr::copy_nonoverlapping(
+                        translation.phys as *const u8,
+                        buffer.add(copied),
+                        chunk,
+                    );
+                }
+            }
+            copied += chunk;
+        }
+        true
+    }
+
     fn free_slot(&self) -> Option<usize> {
         for index in 0..MAX_TASKS {
             let task = self.slots[index].task;
@@ -991,8 +1127,24 @@ pub fn validate_user_buffer(
     })
 }
 
+pub fn copy_from_user(task_id: u64, address: u64, output: &mut [u8]) -> bool {
+    cpu_interrupts::without_interrupts(|| table().copy_from_user(task_id, address, output))
+}
+
+pub fn copy_to_user(task_id: u64, address: u64, input: &[u8]) -> bool {
+    cpu_interrupts::without_interrupts(|| table().copy_to_user(task_id, address, input))
+}
+
 pub fn on_timer_interrupt(context: &mut interrupts::TimerContext) -> TimerAction {
     table_mut().on_timer_interrupt(context)
+}
+
+pub fn block_for_ipc(task_id: u64) -> bool {
+    cpu_interrupts::without_interrupts(|| table_mut().block_for_ipc(task_id))
+}
+
+pub fn wake_from_ipc(task_id: u64) -> bool {
+    cpu_interrupts::without_interrupts(|| table_mut().wake_from_ipc(task_id))
 }
 
 pub fn run_user_probe_task() -> TaskRunResult {
@@ -1220,6 +1372,141 @@ pub fn run_process_tree_test() -> ProcessTreeReport {
         child_exit_code: completed_wait.exit_code,
         parent_completed: parent_result.passed,
         user_buffer_validation,
+        frames_restored,
+        heap_restored,
+        resources_restored,
+        passed,
+    }
+}
+
+pub fn run_ipc_test() -> IpcTestReport {
+    let frames_before = crate::physmem::snapshot();
+    let heap_before = heap::snapshot();
+    let resources_before = snapshot().active_resources;
+    let ipc_before = ipc::snapshot();
+    let scheduler_before = scheduler::snapshot();
+    let sender = cpu_interrupts::without_interrupts(|| table_mut().spawn_elf_init());
+    let receiver = cpu_interrupts::without_interrupts(|| table_mut().spawn_elf_init());
+    let sender_id = sender.map(|task| task.id).unwrap_or(0);
+    let receiver_id = receiver.map(|task| task.id).unwrap_or(0);
+
+    let mut output = [0u8; ipc::MAX_MESSAGE_BYTES];
+    let queued_delivery = ipc::send(sender_id, receiver_id, b"ping").is_ok()
+        && matches!(
+            ipc::receive(receiver_id, &mut output, false),
+            Ok(ipc::ReceiveOutcome::Message(ipc::Delivery {
+                sender,
+                length: 4,
+                ..
+            })) if sender == sender_id
+        )
+        && &output[..4] == b"ping";
+
+    output.fill(0);
+    let blocked_outcome = ipc::receive(receiver_id, &mut output, true);
+    let receiver_blocked = matches!(blocked_outcome, Ok(ipc::ReceiveOutcome::Blocked))
+        && task_by_id(receiver_id)
+            .map(|task| task.state == TaskState::Blocked && task.ipc_waiting)
+            .unwrap_or(false)
+        && scheduler::snapshot().blocked_tasks == scheduler_before.blocked_tasks.saturating_add(1);
+    let wake_send = ipc::send(sender_id, receiver_id, b"wake").is_ok();
+    let receiver_woken = wake_send
+        && task_by_id(receiver_id)
+            .map(|task| task.state == TaskState::Ready && !task.ipc_waiting)
+            .unwrap_or(false)
+        && scheduler::snapshot().blocked_tasks == scheduler_before.blocked_tasks;
+    let wake_delivery = matches!(
+        ipc::receive(receiver_id, &mut output, false),
+        Ok(ipc::ReceiveOutcome::Message(ipc::Delivery {
+            sender,
+            length: 4,
+            ..
+        })) if sender == sender_id
+    ) && &output[..4] == b"wake";
+
+    let mut filled = true;
+    for value in 0..ipc::QUEUE_DEPTH {
+        if ipc::send(sender_id, receiver_id, &[value as u8]).is_err() {
+            filled = false;
+        }
+    }
+    let backpressure =
+        filled && ipc::send(sender_id, receiver_id, b"overflow") == Err(ipc::IpcError::QueueFull);
+    let mut fifo_order = true;
+    for expected in 0..ipc::QUEUE_DEPTH {
+        output.fill(0);
+        match ipc::receive(receiver_id, &mut output, false) {
+            Ok(ipc::ReceiveOutcome::Message(delivery))
+                if delivery.sender == sender_id
+                    && delivery.length == 1
+                    && output[0] == expected as u8 => {}
+            _ => fifo_order = false,
+        }
+    }
+
+    let syscalls = user::snapshot().syscall_count;
+    if sender_id != 0 {
+        cpu_interrupts::without_interrupts(|| {
+            let _ = table_mut().mark_exited(sender_id, 0, syscalls);
+            let _ = table_mut().cleanup_task(sender_id);
+        });
+    }
+    if receiver_id != 0 {
+        cpu_interrupts::without_interrupts(|| {
+            let _ = table_mut().mark_exited(receiver_id, 0, syscalls);
+            let _ = table_mut().cleanup_task(receiver_id);
+        });
+    }
+
+    let frames_after = crate::physmem::snapshot();
+    let heap_after = heap::snapshot();
+    let resources_after = snapshot().active_resources;
+    let ipc_after = ipc::snapshot();
+    let endpoint_cleanup = ipc_after.active_endpoints == ipc_before.active_endpoints
+        && ipc_after.queued_messages == ipc_before.queued_messages
+        && ipc_after.waiting_receivers == ipc_before.waiting_receivers;
+    let frames_restored = frames_after.allocated_frames == frames_before.allocated_frames
+        && frames_after.free_frames == frames_before.free_frames;
+    let heap_restored = heap_after.active_allocations == heap_before.active_allocations
+        && heap_after.allocated_bytes == heap_before.allocated_bytes
+        && heap_after.free_bytes == heap_before.free_bytes
+        && heap_after.metadata_ok
+        && heap_after.sentinel_ok
+        && heap_after.allocation_canaries_ok;
+    let resources_restored = resources_after == resources_before;
+    let passed = sender_id != 0
+        && receiver_id != 0
+        && queued_delivery
+        && receiver_blocked
+        && receiver_woken
+        && wake_delivery
+        && fifo_order
+        && backpressure
+        && endpoint_cleanup
+        && frames_restored
+        && heap_restored
+        && resources_restored
+        && ipc::selftest();
+
+    serial::log_bool("ipc", "queued delivery", queued_delivery);
+    serial::log_bool("ipc", "receiver blocked", receiver_blocked);
+    serial::log_bool("ipc", "receiver woken", receiver_woken);
+    serial::log_bool("ipc", "wake delivery", wake_delivery);
+    serial::log_bool("ipc", "fifo order", fifo_order);
+    serial::log_bool("ipc", "backpressure", backpressure);
+    serial::log_bool("ipc", "endpoint cleanup", endpoint_cleanup);
+    serial::log_bool("ipc", "ipc test", passed);
+
+    IpcTestReport {
+        sender_id,
+        receiver_id,
+        queued_delivery,
+        receiver_blocked,
+        receiver_woken,
+        wake_delivery,
+        fifo_order,
+        backpressure,
+        endpoint_cleanup,
         frames_restored,
         heap_restored,
         resources_restored,
@@ -1474,6 +1761,7 @@ pub fn selftest() -> bool {
         && user::probe_stack_top() != 0
         && user::probe_expected_exit_code() == 42
         && elf::selftest()
+        && ipc::selftest()
 }
 
 fn initial_timer_context(entry_point: u64, stack_top: u64) -> interrupts::TimerContext {

@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 
 const USER_ELF_BASE: u64 = 0x4010_0000;
+const USER_DATA_BASE: u64 = USER_ELF_BASE + PAGE_SIZE;
 const PAGE_SIZE: u64 = 4096;
 const ELF_HEADER_SIZE: usize = 64;
 const PROGRAM_HEADER_SIZE: usize = 56;
@@ -11,14 +12,6 @@ const TEXT_OFFSET: usize = 0x1000;
 const DATA_OFFSET: usize = 0x2000;
 const INIT_DATA: [u8; 16] = *b"Tobacco init\0\0\0\0";
 const INIT_ELF_SIZE: usize = DATA_OFFSET + INIT_DATA.len();
-
-const INIT_CODE: [u8; 71] = [
-    0x48, 0xb8, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0xbf, 0x01, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0xcd, 0x80, 0x48, 0xb8, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0xcd, 0x80, 0x48, 0xb8, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xcd, 0x80, 0x48, 0xb8,
-    0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0xbf, 0x2a, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0xcd, 0x80, 0xf4, 0xeb, 0xfd,
-];
 
 fn main() {
     let output = env::args()
@@ -36,6 +29,8 @@ fn main() {
 
 fn build_init_elf() -> Vec<u8> {
     let mut image = vec![0u8; INIT_ELF_SIZE];
+    let init_code = build_init_code();
+    assert!(init_code.len() <= PAGE_SIZE as usize);
 
     image[0..4].copy_from_slice(b"\x7fELF");
     image[4] = 2;
@@ -56,8 +51,8 @@ fn build_init_elf() -> Vec<u8> {
     write_u32(&mut image, text_header + 4, 5);
     write_u64(&mut image, text_header + 8, TEXT_OFFSET as u64);
     write_u64(&mut image, text_header + 16, USER_ELF_BASE);
-    write_u64(&mut image, text_header + 32, INIT_CODE.len() as u64);
-    write_u64(&mut image, text_header + 40, INIT_CODE.len() as u64);
+    write_u64(&mut image, text_header + 32, init_code.len() as u64);
+    write_u64(&mut image, text_header + 40, init_code.len() as u64);
     write_u64(&mut image, text_header + 48, PAGE_SIZE);
 
     let data_header = ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE;
@@ -69,9 +64,69 @@ fn build_init_elf() -> Vec<u8> {
     write_u64(&mut image, data_header + 40, PAGE_SIZE);
     write_u64(&mut image, data_header + 48, PAGE_SIZE);
 
-    image[TEXT_OFFSET..TEXT_OFFSET + INIT_CODE.len()].copy_from_slice(&INIT_CODE);
+    image[TEXT_OFFSET..TEXT_OFFSET + init_code.len()].copy_from_slice(&init_code);
     image[DATA_OFFSET..DATA_OFFSET + INIT_DATA.len()].copy_from_slice(&INIT_DATA);
     image
+}
+
+fn build_init_code() -> Vec<u8> {
+    let mut code = Vec::new();
+
+    emit_mov_rax(&mut code, 1);
+    emit_mov_rdi(&mut code, 1);
+    emit_int80(&mut code);
+
+    emit_mov_rax(&mut code, 4);
+    emit_int80(&mut code);
+
+    emit_mov_rax(&mut code, 2);
+    emit_int80(&mut code);
+
+    emit_mov_rax(&mut code, 7);
+    emit_int80(&mut code);
+    code.extend_from_slice(&[0x49, 0x89, 0xc4]);
+
+    emit_mov_rax(&mut code, 5);
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7]);
+    emit_mov_rsi(&mut code, USER_DATA_BASE);
+    emit_mov_rdx(&mut code, 4);
+    emit_int80(&mut code);
+
+    emit_mov_rax(&mut code, 6);
+    emit_mov_rdi(&mut code, USER_DATA_BASE + 8);
+    emit_mov_rsi(&mut code, 8);
+    emit_int80(&mut code);
+
+    emit_mov_rax(&mut code, 3);
+    emit_mov_rdi(&mut code, 42);
+    emit_int80(&mut code);
+    code.extend_from_slice(&[0xf4, 0xeb, 0xfd]);
+    code
+}
+
+fn emit_mov_rax(code: &mut Vec<u8>, value: u64) {
+    emit_mov_imm64(code, 0xb8, value);
+}
+
+fn emit_mov_rdi(code: &mut Vec<u8>, value: u64) {
+    emit_mov_imm64(code, 0xbf, value);
+}
+
+fn emit_mov_rsi(code: &mut Vec<u8>, value: u64) {
+    emit_mov_imm64(code, 0xbe, value);
+}
+
+fn emit_mov_rdx(code: &mut Vec<u8>, value: u64) {
+    emit_mov_imm64(code, 0xba, value);
+}
+
+fn emit_mov_imm64(code: &mut Vec<u8>, opcode: u8, value: u64) {
+    code.extend_from_slice(&[0x48, opcode]);
+    code.extend_from_slice(&value.to_le_bytes());
+}
+
+fn emit_int80(code: &mut Vec<u8>) {
+    code.extend_from_slice(&[0xcd, 0x80]);
 }
 
 fn build_initramfs(init_elf: &[u8]) -> Vec<u8> {
