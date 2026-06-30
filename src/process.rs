@@ -103,6 +103,12 @@ impl UserCodeBuilder {
         self.syscall(crate::syscall::SYSCALL_IPC_SEND);
     }
 
+    fn revoke_capability(&mut self, capability: u64, expected_revoked: u64) {
+        self.mov_imm64(0xbf, capability);
+        self.syscall(crate::syscall::SYSCALL_IPC_REVOKE);
+        self.expect_rax_and_exit(expected_revoked, IPC_TEST_EXIT_CODE, IPC_TEST_EXIT_CODE + 1);
+    }
+
     fn wait_ticks(&mut self, ticks: u8) {
         self.syscall(crate::syscall::SYSCALL_UPTIME);
         self.bytes(&[0x49, 0x89, 0xc4]);
@@ -461,6 +467,30 @@ pub struct CapabilityTransferReport {
     pub blocking_switches: u64,
     pub restart_completions: u64,
     pub scheduler_clean: bool,
+    pub frame_baseline: bool,
+    pub heap_baseline: bool,
+    pub resource_baseline: bool,
+    pub passed: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct CapabilityRevocationReport {
+    pub owner_id: u64,
+    pub middle_id: u64,
+    pub target_id: u64,
+    pub chain_created: bool,
+    pub revocation_syscall: bool,
+    pub cascade_revoked: bool,
+    pub queued_attachment_stripped: bool,
+    pub message_preserved: bool,
+    pub descendants_stale: bool,
+    pub revoke_before_send: bool,
+    pub receive_before_revoke: bool,
+    pub cancel_after_revoke_denied: bool,
+    pub blocked_target_preserved: bool,
+    pub cleanup_cascade: bool,
+    pub scheduler_clean: bool,
+    pub endpoint_clean: bool,
     pub frame_baseline: bool,
     pub heap_baseline: bool,
     pub resource_baseline: bool,
@@ -843,6 +873,18 @@ impl ProcessTable {
             );
             program.receive_timeout(100);
         }
+        program.bytes(&[0xf4, 0xeb, 0xfd]);
+        self.write_user_program(task_id, &program)
+    }
+
+    fn install_capability_revoke_program(
+        &mut self,
+        task_id: u64,
+        capability: u64,
+        expected_revoked: u64,
+    ) -> bool {
+        let mut program = UserCodeBuilder::new();
+        program.revoke_capability(capability, expected_revoked);
         program.bytes(&[0xf4, 0xeb, 0xfd]);
         self.write_user_program(task_id, &program)
     }
@@ -2742,6 +2784,381 @@ pub fn run_capability_transfer_test() -> CapabilityTransferReport {
         resource_baseline,
         passed,
     }
+}
+
+pub fn run_capability_revocation_test() -> CapabilityRevocationReport {
+    let frames_before = crate::physmem::snapshot();
+    let heap_before = heap::snapshot();
+    let resources_before = snapshot().active_resources;
+    let scheduler_before = scheduler::snapshot();
+    let ipc_before = ipc::snapshot();
+    let owner = cpu_interrupts::without_interrupts(|| table_mut().spawn_elf_init());
+    let middle = cpu_interrupts::without_interrupts(|| table_mut().spawn_elf_init());
+    let target = cpu_interrupts::without_interrupts(|| table_mut().spawn_elf_init());
+    let owner_id = owner.map(|task| task.id).unwrap_or(0);
+    let middle_id = middle.map(|task| task.id).unwrap_or(0);
+    let target_id = target.map(|task| task.id).unwrap_or(0);
+    let mut output = [0u8; ipc::MAX_MESSAGE_BYTES];
+
+    let destination = ipc::grant_capability(owner_id, middle_id, ipc::CapabilityRights::SEND).ok();
+    let root = ipc::grant_capability(
+        owner_id,
+        target_id,
+        ipc::CapabilityRights::SEND_CANCEL_DELEGATE,
+    )
+    .ok();
+    let root_info = root.and_then(|handle| capability_for_handle(owner_id, handle));
+    let first_transfer = match (destination, root) {
+        (Some(destination), Some(root)) => ipc::send_with_capability(
+            owner_id,
+            destination,
+            root,
+            ipc::CapabilityRights::SEND_DELEGATE,
+            b"child",
+        )
+        .is_ok(),
+        _ => false,
+    };
+    let child_delivery = if first_transfer {
+        match ipc::receive(middle_id, &mut output, false) {
+            Ok(ipc::ReceiveOutcome::Message(delivery)) => Some(delivery),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let child_handle = child_delivery
+        .map(|delivery| delivery.capability_handle)
+        .unwrap_or(0);
+    let child_info = capability_for_handle(middle_id, child_handle);
+    let second_transfer = if child_handle != 0 {
+        ipc::send_with_capability(
+            middle_id,
+            child_handle,
+            child_handle,
+            ipc::CapabilityRights::SEND,
+            b"leaf",
+        )
+        .is_ok()
+    } else {
+        false
+    };
+    let grandchild_info = child_info.and_then(|child| {
+        (0..ipc::MAX_CAPABILITIES_PER_ENDPOINT)
+            .filter_map(|slot| ipc::capability_info(target_id, slot))
+            .find(|capability| {
+                capability.active && capability.parent_generation == child.generation
+            })
+    });
+    let chain_created = first_transfer
+        && second_transfer
+        && matches!(
+            (root_info, child_info, grandchild_info),
+            (Some(root), Some(child), Some(grandchild))
+                if root.parent_generation == 0
+                    && root.lineage_depth == 0
+                    && child.parent_generation == root.generation
+                    && child.lineage_depth == 1
+                    && grandchild.parent_generation == child.generation
+                    && grandchild.lineage_depth == 2
+                    && grandchild.target == target_id
+        );
+
+    let before_cascade = ipc::snapshot();
+    let revoke_configured = root
+        .map(|handle| {
+            cpu_interrupts::without_interrupts(|| {
+                table_mut().install_capability_revoke_program(owner_id, handle, 3)
+            })
+        })
+        .unwrap_or(false);
+    let mut revocation_syscall = false;
+    if revoke_configured {
+        let before = user::snapshot().syscall_count;
+        if cpu_interrupts::without_interrupts(|| table_mut().mark_running(owner_id, before)) {
+            let result = user::run_program_in_address_space(
+                owner.map(|task| task.entry_point).unwrap_or(0),
+                owner.map(|task| task.stack_top).unwrap_or(0),
+                IPC_TEST_EXIT_CODE,
+                2,
+                owner.map(|task| task.address_space_root).unwrap_or(0),
+            );
+            revocation_syscall =
+                result.ran && result.passed && result.exit_code == IPC_TEST_EXIT_CODE;
+        }
+    }
+    let after_cascade = ipc::snapshot();
+    let cascade_revoked = revocation_syscall
+        && after_cascade.capabilities_revoked
+            >= before_cascade.capabilities_revoked.saturating_add(3)
+        && after_cascade.descendant_revocations
+            >= before_cascade.descendant_revocations.saturating_add(2)
+        && after_cascade.cascade_revocations
+            >= before_cascade.cascade_revocations.saturating_add(1);
+    output.fill(0);
+    let stripped_delivery = match ipc::receive(target_id, &mut output, false) {
+        Ok(ipc::ReceiveOutcome::Message(delivery)) => Some(delivery),
+        _ => None,
+    };
+    let queued_attachment_stripped = after_cascade.queued_capabilities_stripped
+        >= before_cascade
+            .queued_capabilities_stripped
+            .saturating_add(1)
+        && matches!(
+            stripped_delivery,
+            Some(delivery)
+                if delivery.capability_handle == 0 && delivery.capability_rights == 0
+        );
+    let message_preserved = matches!(
+        stripped_delivery,
+        Some(delivery) if delivery.sender == middle_id && delivery.length == 4
+    ) && &output[..4] == b"leaf";
+    let grandchild_handle = grandchild_info
+        .map(|capability| capability.handle)
+        .unwrap_or(0);
+    let descendants_stale = child_handle != 0
+        && grandchild_handle != 0
+        && ipc::send_capability(middle_id, child_handle, b"stale")
+            == Err(ipc::IpcError::StaleCapability)
+        && ipc::send_capability(target_id, grandchild_handle, b"stale")
+            == Err(ipc::IpcError::StaleCapability);
+
+    let revoke_first =
+        ipc::grant_capability(owner_id, target_id, ipc::CapabilityRights::SEND_DELEGATE).ok();
+    let queued_before_revoke_first = ipc::snapshot().queued_messages;
+    let revoke_before_send = match (destination, revoke_first) {
+        (Some(destination), Some(root)) => {
+            ipc::revoke_capability_tree(owner_id, root).is_ok()
+                && ipc::send_with_capability(
+                    owner_id,
+                    destination,
+                    root,
+                    ipc::CapabilityRights::SEND,
+                    b"late",
+                ) == Err(ipc::IpcError::StaleCapability)
+                && ipc::snapshot().queued_messages == queued_before_revoke_first
+        }
+        _ => false,
+    };
+
+    let receive_first_root =
+        ipc::grant_capability(owner_id, target_id, ipc::CapabilityRights::SEND_DELEGATE).ok();
+    let receive_first_sent = match (destination, receive_first_root) {
+        (Some(destination), Some(root)) => ipc::send_with_capability(
+            owner_id,
+            destination,
+            root,
+            ipc::CapabilityRights::SEND,
+            b"early",
+        )
+        .is_ok(),
+        _ => false,
+    };
+    let receive_first_delivery = if receive_first_sent {
+        match ipc::receive(middle_id, &mut output, false) {
+            Ok(ipc::ReceiveOutcome::Message(delivery)) => Some(delivery),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let receive_first_child = receive_first_delivery
+        .map(|delivery| delivery.capability_handle)
+        .unwrap_or(0);
+    let receive_before_revoke = match receive_first_root {
+        Some(root) if receive_first_child != 0 => {
+            ipc::revoke_capability_tree(owner_id, root).is_ok()
+                && ipc::send_capability(middle_id, receive_first_child, b"stale")
+                    == Err(ipc::IpcError::StaleCapability)
+        }
+        _ => false,
+    };
+
+    let cancel_root =
+        ipc::grant_capability(owner_id, target_id, ipc::CapabilityRights::CANCEL_DELEGATE).ok();
+    let cancel_sent = match (destination, cancel_root) {
+        (Some(destination), Some(root)) => ipc::send_with_capability(
+            owner_id,
+            destination,
+            root,
+            ipc::CapabilityRights::CANCEL,
+            b"cancel",
+        )
+        .is_ok(),
+        _ => false,
+    };
+    let cancel_delivery = if cancel_sent {
+        match ipc::receive(middle_id, &mut output, false) {
+            Ok(ipc::ReceiveOutcome::Message(delivery)) => Some(delivery),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    output.fill(0);
+    let target_blocked = matches!(
+        ipc::receive(target_id, &mut output, true),
+        Ok(ipc::ReceiveOutcome::Blocked)
+    );
+    let cancel_child = cancel_delivery
+        .map(|delivery| delivery.capability_handle)
+        .unwrap_or(0);
+    let cancel_after_revoke_denied = match cancel_root {
+        Some(root) if cancel_child != 0 => {
+            ipc::revoke_capability_tree(owner_id, root).is_ok()
+                && ipc::cancel_wait(middle_id, cancel_child) == Err(ipc::IpcError::StaleCapability)
+        }
+        _ => false,
+    };
+    let blocked_target_preserved = target_blocked
+        && task_by_id(target_id)
+            .map(|task| task.state == TaskState::Blocked && task.ipc_waiting)
+            .unwrap_or(false);
+
+    let cleanup_root =
+        ipc::grant_capability(owner_id, target_id, ipc::CapabilityRights::SEND_DELEGATE).ok();
+    let cleanup_sent = match (destination, cleanup_root) {
+        (Some(destination), Some(root)) => ipc::send_with_capability(
+            owner_id,
+            destination,
+            root,
+            ipc::CapabilityRights::SEND,
+            b"clean",
+        )
+        .is_ok(),
+        _ => false,
+    };
+    let cleanup_delivery = if cleanup_sent {
+        match ipc::receive(middle_id, &mut output, false) {
+            Ok(ipc::ReceiveOutcome::Message(delivery)) => Some(delivery),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let cleanup_child = cleanup_delivery
+        .map(|delivery| delivery.capability_handle)
+        .unwrap_or(0);
+    let syscalls = user::snapshot().syscall_count;
+    if owner_id != 0 {
+        cpu_interrupts::without_interrupts(|| {
+            let _ = table_mut().mark_exited(owner_id, 0, syscalls);
+            let _ = table_mut().cleanup_task(owner_id);
+        });
+    }
+    let cleanup_cascade = cleanup_child != 0
+        && ipc::send_capability(middle_id, cleanup_child, b"stale")
+            == Err(ipc::IpcError::StaleCapability);
+    for task_id in [middle_id, target_id] {
+        if task_id == 0 {
+            continue;
+        }
+        cpu_interrupts::without_interrupts(|| {
+            let _ = table_mut().mark_exited(task_id, 0, syscalls);
+            let _ = table_mut().cleanup_task(task_id);
+        });
+    }
+
+    let ipc_after = ipc::snapshot();
+    let scheduler_after = scheduler::snapshot();
+    let frames_after = crate::physmem::snapshot();
+    let heap_after = heap::snapshot();
+    let resources_after = snapshot().active_resources;
+    let scheduler_clean = scheduler_after.current_task == scheduler_before.current_task
+        && scheduler_after.queued_tasks == scheduler_before.queued_tasks
+        && scheduler_after.blocked_tasks == scheduler_before.blocked_tasks;
+    let endpoint_clean = ipc_after.active_endpoints == ipc_before.active_endpoints
+        && ipc_after.active_capabilities == ipc_before.active_capabilities
+        && ipc_after.queued_messages == ipc_before.queued_messages
+        && ipc_after.waiting_receivers == ipc_before.waiting_receivers;
+    let frame_baseline = frames_after.allocated_frames == frames_before.allocated_frames
+        && frames_after.free_frames == frames_before.free_frames;
+    let heap_baseline = heap_after.active_allocations == heap_before.active_allocations
+        && heap_after.allocated_bytes == heap_before.allocated_bytes
+        && heap_after.free_bytes == heap_before.free_bytes
+        && heap_after.metadata_ok
+        && heap_after.sentinel_ok
+        && heap_after.allocation_canaries_ok;
+    let resource_baseline = resources_after == resources_before;
+    let passed = owner_id != 0
+        && middle_id != 0
+        && target_id != 0
+        && chain_created
+        && revocation_syscall
+        && cascade_revoked
+        && queued_attachment_stripped
+        && message_preserved
+        && descendants_stale
+        && revoke_before_send
+        && receive_before_revoke
+        && cancel_after_revoke_denied
+        && blocked_target_preserved
+        && cleanup_cascade
+        && scheduler_clean
+        && endpoint_clean
+        && frame_baseline
+        && heap_baseline
+        && resource_baseline
+        && ipc_after.cascade_revocations >= ipc_before.cascade_revocations.saturating_add(4)
+        && ipc_after.queued_capabilities_stripped
+            >= ipc_before.queued_capabilities_stripped.saturating_add(1)
+        && ipc::selftest();
+
+    serial::log_bool("ipc-revoke", "lineage chain created", chain_created);
+    serial::log_bool("ipc-revoke", "Ring 3 revoke syscall", revocation_syscall);
+    serial::log_bool("ipc-revoke", "cascade revoked", cascade_revoked);
+    serial::log_bool(
+        "ipc-revoke",
+        "queued attachment stripped",
+        queued_attachment_stripped,
+    );
+    serial::log_bool("ipc-revoke", "message preserved", message_preserved);
+    serial::log_bool("ipc-revoke", "descendants stale", descendants_stale);
+    serial::log_bool("ipc-revoke", "revoke before send", revoke_before_send);
+    serial::log_bool("ipc-revoke", "receive before revoke", receive_before_revoke);
+    serial::log_bool(
+        "ipc-revoke",
+        "cancel after revoke denied",
+        cancel_after_revoke_denied,
+    );
+    serial::log_bool(
+        "ipc-revoke",
+        "blocked target preserved",
+        blocked_target_preserved,
+    );
+    serial::log_bool("ipc-revoke", "cleanup cascade", cleanup_cascade);
+    serial::log_bool("ipc-revoke", "scheduler clean", scheduler_clean);
+    serial::log_bool("ipc-revoke", "endpoint clean", endpoint_clean);
+    serial::log_bool("ipc-revoke", "revocation tree test", passed);
+
+    CapabilityRevocationReport {
+        owner_id,
+        middle_id,
+        target_id,
+        chain_created,
+        revocation_syscall,
+        cascade_revoked,
+        queued_attachment_stripped,
+        message_preserved,
+        descendants_stale,
+        revoke_before_send,
+        receive_before_revoke,
+        cancel_after_revoke_denied,
+        blocked_target_preserved,
+        cleanup_cascade,
+        scheduler_clean,
+        endpoint_clean,
+        frame_baseline,
+        heap_baseline,
+        resource_baseline,
+        passed,
+    }
+}
+
+fn capability_for_handle(owner: u64, handle: u64) -> Option<ipc::CapabilityInfo> {
+    (0..ipc::MAX_CAPABILITIES_PER_ENDPOINT)
+        .filter_map(|slot| ipc::capability_info(owner, slot))
+        .find(|capability| capability.active && capability.handle == handle)
 }
 
 pub fn run_preemption_test() -> PreemptionReport {

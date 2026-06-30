@@ -12,6 +12,7 @@ pub const SYSCALL_IPC_SELF: u64 = 8;
 pub const SYSCALL_IPC_RECEIVE_TIMEOUT: u64 = 9;
 pub const SYSCALL_IPC_CANCEL: u64 = 10;
 pub const SYSCALL_IPC_SEND_CAPABILITY: u64 = 11;
+pub const SYSCALL_IPC_REVOKE: u64 = 12;
 
 pub const RET_OK: u64 = 0;
 pub const RET_UNKNOWN_SYSCALL: u64 = u64::MAX;
@@ -69,7 +70,7 @@ pub struct Snapshot {
     pub last_return: u64,
 }
 
-const SYSCALLS: [SyscallEntry; 11] = [
+const SYSCALLS: [SyscallEntry; 12] = [
     SyscallEntry {
         number: SYSCALL_LOG,
         name: "log",
@@ -158,6 +159,14 @@ const SYSCALLS: [SyscallEntry; 11] = [
         logging: true,
         handler: syscall_ipc_send_capability,
     },
+    SyscallEntry {
+        number: SYSCALL_IPC_REVOKE,
+        name: "ipc_revoke",
+        arg_count: 1,
+        return_code: ReturnCode::Dynamic,
+        logging: true,
+        handler: syscall_ipc_revoke,
+    },
 ];
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -241,7 +250,7 @@ pub fn lookup(number: u64) -> Option<&'static SyscallEntry> {
 
 pub fn selftest() -> bool {
     INITIALIZED.load(Ordering::Acquire)
-        && SYSCALLS.len() == 11
+        && SYSCALLS.len() == 12
         && lookup(SYSCALL_LOG).is_some()
         && lookup(SYSCALL_UPTIME).is_some()
         && lookup(SYSCALL_EXIT).is_some()
@@ -253,6 +262,7 @@ pub fn selftest() -> bool {
         && lookup(SYSCALL_IPC_RECEIVE_TIMEOUT).is_some()
         && lookup(SYSCALL_IPC_CANCEL).is_some()
         && lookup(SYSCALL_IPC_SEND_CAPABILITY).is_some()
+        && lookup(SYSCALL_IPC_REVOKE).is_some()
         && table_numbers_unique()
         && SYSCALLS[0].arg_count == 1
         && SYSCALLS[1].arg_count == 0
@@ -265,6 +275,7 @@ pub fn selftest() -> bool {
         && SYSCALLS[8].arg_count == 3
         && SYSCALLS[9].arg_count == 1
         && SYSCALLS[10].arg_count == 5
+        && SYSCALLS[11].arg_count == 1
 }
 
 pub fn return_code_name(code: ReturnCode) -> &'static str {
@@ -457,6 +468,26 @@ fn syscall_ipc_send_capability(
         Ok(sequence) => {
             serial::log_u64("ipc-cap", "syscall transfer bytes", length as u64);
             SyscallOutcome::complete(sequence)
+        }
+        Err(error) => SyscallOutcome::complete(ipc_error_return(error)),
+    }
+}
+
+fn syscall_ipc_revoke(handle: u64, _frame: &mut user::SyscallFrame) -> SyscallOutcome {
+    let owner = scheduler::snapshot().current_task;
+    if owner == 0 {
+        return SyscallOutcome::complete(ipc_error_return(ipc::IpcError::InvalidTask));
+    }
+    match ipc::revoke_capability_tree(owner, handle) {
+        Ok(report) => {
+            serial::log_u64("ipc-cap", "revoked tree size", report.revoked);
+            serial::log_u64("ipc-cap", "revoked descendants", report.descendants);
+            serial::log_u64(
+                "ipc-cap",
+                "queued capabilities stripped",
+                report.queued_stripped,
+            );
+            SyscallOutcome::complete(report.revoked)
         }
         Err(error) => SyscallOutcome::complete(ipc_error_return(error)),
     }

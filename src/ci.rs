@@ -285,6 +285,7 @@ fn run_command_table_checks() {
     check("command captest", shell::command_exists(b"captest"));
     check("command ipcwait", shell::command_exists(b"ipcwait"));
     check("command capxfer", shell::command_exists(b"capxfer"));
+    check("command caprevoke", shell::command_exists(b"caprevoke"));
     check("command tasks", shell::command_exists(b"tasks"));
     check("command sched", shell::command_exists(b"sched"));
     check("command preempt", shell::command_exists(b"preempt"));
@@ -798,6 +799,7 @@ fn run_ipc_checks() -> bool {
     let capability = process::run_capability_test();
     let wait_control = process::run_ipc_wait_control_test();
     let transfer = process::run_capability_transfer_test();
+    let revocation = process::run_capability_revocation_test();
     let ipc_after = ipc::snapshot();
     let scheduler_after = scheduler::snapshot();
     let mut ok = true;
@@ -908,20 +910,52 @@ fn run_ipc_checks() -> bool {
     ok &= check("ipc transfer heap baseline", transfer.heap_baseline);
     ok &= check("ipc transfer resource baseline", transfer.resource_baseline);
     ok &= check("ipc transfer status", transfer.passed);
+    ok &= check("ipc revoke lineage chain", revocation.chain_created);
+    ok &= check("ipc revoke Ring 3 syscall", revocation.revocation_syscall);
+    ok &= check("ipc revoke cascade", revocation.cascade_revoked);
+    ok &= check(
+        "ipc revoke queued attachment stripped",
+        revocation.queued_attachment_stripped,
+    );
+    ok &= check("ipc revoke message preserved", revocation.message_preserved);
+    ok &= check("ipc revoke descendants stale", revocation.descendants_stale);
+    ok &= check("ipc revoke before send", revocation.revoke_before_send);
+    ok &= check(
+        "ipc receive before revoke",
+        revocation.receive_before_revoke,
+    );
+    ok &= check(
+        "ipc cancel after revoke denied",
+        revocation.cancel_after_revoke_denied,
+    );
+    ok &= check(
+        "ipc revoke blocked target preserved",
+        revocation.blocked_target_preserved,
+    );
+    ok &= check("ipc revoke cleanup cascade", revocation.cleanup_cascade);
+    ok &= check("ipc revoke scheduler clean", revocation.scheduler_clean);
+    ok &= check("ipc revoke endpoint clean", revocation.endpoint_clean);
+    ok &= check("ipc revoke frame baseline", revocation.frame_baseline);
+    ok &= check("ipc revoke heap baseline", revocation.heap_baseline);
+    ok &= check("ipc revoke resource baseline", revocation.resource_baseline);
+    ok &= check("ipc revoke status", revocation.passed);
     ok &= check(
         "ipc accounting",
-        ipc_after.messages_sent >= ipc_before.messages_sent.saturating_add(25)
-            && ipc_after.messages_received >= ipc_before.messages_received.saturating_add(25)
+        ipc_after.messages_sent >= ipc_before.messages_sent.saturating_add(30)
+            && ipc_after.messages_received >= ipc_before.messages_received.saturating_add(30)
             && ipc_after.blocked_receives > ipc_before.blocked_receives
             && ipc_after.receiver_wakeups > ipc_before.receiver_wakeups
             && ipc_after.queue_full_events > ipc_before.queue_full_events
-            && ipc_after.capability_denials >= ipc_before.capability_denials.saturating_add(7)
+            && ipc_after.capability_denials >= ipc_before.capability_denials.saturating_add(13)
             && ipc_after.stale_capability_denials
-                >= ipc_before.stale_capability_denials.saturating_add(2)
+                >= ipc_before.stale_capability_denials.saturating_add(8)
             && ipc_after.capability_transfers >= ipc_before.capability_transfers.saturating_add(1)
-            && ipc_after.rights_attenuations >= ipc_before.rights_attenuations.saturating_add(1)
+            && ipc_after.rights_attenuations >= ipc_before.rights_attenuations.saturating_add(6)
             && ipc_after.capability_transfer_failures
-                >= ipc_before.capability_transfer_failures.saturating_add(5),
+                >= ipc_before.capability_transfer_failures.saturating_add(6)
+            && ipc_after.cascade_revocations >= ipc_before.cascade_revocations.saturating_add(4)
+            && ipc_after.queued_capabilities_stripped
+                >= ipc_before.queued_capabilities_stripped.saturating_add(1),
     );
     ok &= check(
         "ipc scheduler wakeup",

@@ -6,6 +6,7 @@ pub const MAX_ENDPOINTS: usize = 8;
 pub const QUEUE_DEPTH: usize = 8;
 pub const MAX_MESSAGE_BYTES: usize = 64;
 pub const MAX_CAPABILITIES_PER_ENDPOINT: usize = 8;
+pub const MAX_CAPABILITY_LINEAGE_DEPTH: u8 = 16;
 const CAPABILITY_SLOT_BITS: u64 = 8;
 const CAPABILITY_SLOT_MASK: u64 = (1 << CAPABILITY_SLOT_BITS) - 1;
 
@@ -20,6 +21,7 @@ impl CapabilityRights {
     pub const SEND_RECEIVE: Self = Self(Self::SEND.0 | Self::RECEIVE.0);
     pub const SEND_CANCEL: Self = Self(Self::SEND.0 | Self::CANCEL.0);
     pub const SEND_DELEGATE: Self = Self(Self::SEND.0 | Self::DELEGATE.0);
+    pub const CANCEL_DELEGATE: Self = Self(Self::CANCEL.0 | Self::DELEGATE.0);
     pub const SEND_CANCEL_DELEGATE: Self = Self(Self::SEND.0 | Self::CANCEL.0 | Self::DELEGATE.0);
     pub const ALL: Self = Self(Self::SEND_RECEIVE.0 | Self::CANCEL.0 | Self::DELEGATE.0);
 
@@ -66,6 +68,7 @@ pub enum IpcError {
     Cancelled,
     NotWaiting,
     RightsEscalation,
+    LineageDepthExceeded,
 }
 
 #[derive(Clone, Copy)]
@@ -121,6 +124,11 @@ pub struct Snapshot {
     pub capability_transfer_failures: u64,
     pub rights_attenuations: u64,
     pub last_transferred_rights: u64,
+    pub revocation_trees: u64,
+    pub cascade_revocations: u64,
+    pub descendant_revocations: u64,
+    pub queued_capabilities_stripped: u64,
+    pub last_revocation_size: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -129,13 +137,41 @@ pub struct CapabilityInfo {
     pub handle: u64,
     pub target: u64,
     pub rights: u8,
+    pub generation: u64,
+    pub parent_generation: u64,
+    pub lineage_depth: u8,
     pub active: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct RevocationReport {
+    pub revoked: u64,
+    pub descendants: u64,
+    pub queued_stripped: u64,
+}
+
+impl RevocationReport {
+    const fn empty() -> Self {
+        Self {
+            revoked: 0,
+            descendants: 0,
+            queued_stripped: 0,
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.revoked = self.revoked.saturating_add(other.revoked);
+        self.descendants = self.descendants.saturating_add(other.descendants);
+        self.queued_stripped = self.queued_stripped.saturating_add(other.queued_stripped);
+    }
 }
 
 #[derive(Clone, Copy)]
 struct Capability {
     target: u64,
     generation: u64,
+    parent_generation: u64,
+    lineage_depth: u8,
     rights: CapabilityRights,
     active: bool,
 }
@@ -145,6 +181,8 @@ impl Capability {
         Self {
             target: 0,
             generation: 0,
+            parent_generation: 0,
+            lineage_depth: 0,
             rights: CapabilityRights(0),
             active: false,
         }
@@ -252,6 +290,11 @@ struct IpcState {
     capability_transfer_failures: u64,
     rights_attenuations: u64,
     last_transferred_rights: u64,
+    revocation_trees: u64,
+    cascade_revocations: u64,
+    descendant_revocations: u64,
+    queued_capabilities_stripped: u64,
+    last_revocation_size: u64,
 }
 
 impl IpcState {
@@ -282,6 +325,11 @@ impl IpcState {
             capability_transfer_failures: 0,
             rights_attenuations: 0,
             last_transferred_rights: 0,
+            revocation_trees: 0,
+            cascade_revocations: 0,
+            descendant_revocations: 0,
+            queued_capabilities_stripped: 0,
+            last_revocation_size: 0,
         }
     }
 
@@ -316,6 +364,8 @@ impl IpcState {
         self.endpoints[index].capabilities[0] = Capability {
             target: task_id,
             generation,
+            parent_generation: 0,
+            lineage_depth: 0,
             rights: CapabilityRights::ALL,
             active: true,
         };
@@ -329,28 +379,24 @@ impl IpcState {
             return Err(IpcError::EndpointMissing);
         };
         let dropped = self.endpoints[index].len as u64;
-        let mut revoked = self.endpoints[index]
+        let mut report = RevocationReport::empty();
+
+        while let Some(generation) = self.endpoints[index]
             .capabilities
             .iter()
-            .filter(|capability| capability.active)
-            .count() as u64;
-        self.endpoints[index] = Endpoint::empty();
-        for endpoint in self.endpoints.iter_mut() {
-            if endpoint.owner == 0 {
-                continue;
-            }
-            for capability in endpoint.capabilities.iter_mut() {
-                if capability.active && capability.target == task_id {
-                    *capability = Capability::empty();
-                    revoked = revoked.saturating_add(1);
-                }
-            }
+            .find(|capability| capability.active)
+            .map(|capability| capability.generation)
+        {
+            report.merge(self.revoke_generation(generation));
         }
+        while let Some(generation) = self.find_target_generation(task_id) {
+            report.merge(self.revoke_generation(generation));
+        }
+
+        self.endpoints[index] = Endpoint::empty();
         self.endpoints_destroyed = self.endpoints_destroyed.saturating_add(1);
         self.dropped_on_cleanup = self.dropped_on_cleanup.saturating_add(dropped);
-        self.capabilities_revoked = self.capabilities_revoked.saturating_add(revoked);
-        self.capabilities_revoked_on_cleanup =
-            self.capabilities_revoked_on_cleanup.saturating_add(revoked);
+        self.record_revocation(report, true);
         Ok(dropped)
     }
 
@@ -395,6 +441,8 @@ impl IpcState {
         self.endpoints[owner_index].capabilities[slot] = Capability {
             target,
             generation,
+            parent_generation: 0,
+            lineage_depth: 0,
             rights,
             active: true,
         };
@@ -402,7 +450,7 @@ impl IpcState {
         Ok(encode_handle(slot, generation))
     }
 
-    fn revoke(&mut self, owner: u64, handle: u64) -> Result<(), IpcError> {
+    fn revoke(&mut self, owner: u64, handle: u64) -> Result<RevocationReport, IpcError> {
         let Some(owner_index) = self.find(owner) else {
             return Err(IpcError::EndpointMissing);
         };
@@ -412,14 +460,115 @@ impl IpcState {
             self.record_denial(true);
             return Err(IpcError::StaleCapability);
         }
-        if slot == 0 {
-            self.record_denial(false);
-            return Err(IpcError::PermissionDenied);
+        let report = if slot == 0 {
+            self.revoke_children(generation)
+        } else {
+            self.revoke_generation(generation)
+        };
+        self.record_revocation(report, false);
+        Ok(report)
+    }
+
+    fn revoke_children(&mut self, generation: u64) -> RevocationReport {
+        let mut report = RevocationReport::empty();
+        while let Some(child_generation) = self.find_child_generation(generation) {
+            self.revoke_branch(child_generation, true, &mut report);
+        }
+        report
+    }
+
+    fn revoke_generation(&mut self, generation: u64) -> RevocationReport {
+        let mut report = RevocationReport::empty();
+        self.revoke_branch(generation, false, &mut report);
+        report
+    }
+
+    fn revoke_branch(&mut self, generation: u64, descendant: bool, report: &mut RevocationReport) {
+        let mut removed = false;
+        'remove: for endpoint in self.endpoints.iter_mut() {
+            for capability in endpoint.capabilities.iter_mut() {
+                if capability.active && capability.generation == generation {
+                    *capability = Capability::empty();
+                    removed = true;
+                    break 'remove;
+                }
+            }
+        }
+        if !removed {
+            return;
         }
 
-        self.endpoints[owner_index].capabilities[slot] = Capability::empty();
-        self.capabilities_revoked = self.capabilities_revoked.saturating_add(1);
-        Ok(())
+        report.revoked = report.revoked.saturating_add(1);
+        if descendant {
+            report.descendants = report.descendants.saturating_add(1);
+        }
+        report.queued_stripped = report
+            .queued_stripped
+            .saturating_add(self.strip_queued_generation(generation));
+
+        while let Some(child_generation) = self.find_child_generation(generation) {
+            self.revoke_branch(child_generation, true, report);
+        }
+    }
+
+    fn find_child_generation(&self, parent_generation: u64) -> Option<u64> {
+        self.endpoints
+            .iter()
+            .flat_map(|endpoint| endpoint.capabilities.iter())
+            .find(|capability| {
+                capability.active && capability.parent_generation == parent_generation
+            })
+            .map(|capability| capability.generation)
+    }
+
+    fn find_target_generation(&self, target: u64) -> Option<u64> {
+        self.endpoints
+            .iter()
+            .flat_map(|endpoint| endpoint.capabilities.iter())
+            .find(|capability| capability.active && capability.target == target)
+            .map(|capability| capability.generation)
+    }
+
+    fn strip_queued_generation(&mut self, generation: u64) -> u64 {
+        let mut stripped = 0u64;
+        for endpoint in self.endpoints.iter_mut() {
+            for offset in 0..endpoint.len {
+                let index = (endpoint.head + offset) % QUEUE_DEPTH;
+                let message = &mut endpoint.queue[index];
+                let Some((_, queued_generation)) = decode_handle(message.capability_handle) else {
+                    continue;
+                };
+                if queued_generation == generation {
+                    message.capability_handle = 0;
+                    message.capability_rights = 0;
+                    stripped = stripped.saturating_add(1);
+                }
+            }
+        }
+        stripped
+    }
+
+    fn record_revocation(&mut self, report: RevocationReport, cleanup: bool) {
+        if report.revoked == 0 {
+            return;
+        }
+        self.revocation_trees = self.revocation_trees.saturating_add(1);
+        if report.descendants != 0 {
+            self.cascade_revocations = self.cascade_revocations.saturating_add(1);
+        }
+        self.capabilities_revoked = self.capabilities_revoked.saturating_add(report.revoked);
+        if cleanup {
+            self.capabilities_revoked_on_cleanup = self
+                .capabilities_revoked_on_cleanup
+                .saturating_add(report.revoked);
+        }
+        self.descendant_revocations = self
+            .descendant_revocations
+            .saturating_add(report.descendants);
+        self.queued_capabilities_stripped = self
+            .queued_capabilities_stripped
+            .saturating_add(report.queued_stripped);
+        self.last_revocation_size = report.revoked;
     }
 
     fn resolve(
@@ -454,7 +603,8 @@ impl IpcState {
             return Err(IpcError::PermissionDenied);
         }
         if self.find(capability.target).is_none() {
-            self.endpoints[owner_index].capabilities[slot] = Capability::empty();
+            let report = self.revoke_generation(capability.generation);
+            self.record_revocation(report, true);
             self.record_denial(true);
             return Err(IpcError::StaleCapability);
         }
@@ -520,6 +670,14 @@ impl IpcState {
             self.record_denial(false);
             return Err(IpcError::InvalidRights);
         }
+        let Some(lineage_depth) = source.lineage_depth.checked_add(1) else {
+            self.record_denial(false);
+            return Err(IpcError::LineageDepthExceeded);
+        };
+        if lineage_depth > MAX_CAPABILITY_LINEAGE_DEPTH {
+            self.record_denial(false);
+            return Err(IpcError::LineageDepthExceeded);
+        }
 
         let Some(receiver_index) = self.find(receiver) else {
             return Err(IpcError::EndpointMissing);
@@ -551,6 +709,8 @@ impl IpcState {
         self.endpoints[receiver_index].capabilities[recipient_slot] = Capability {
             target: source.target,
             generation,
+            parent_generation: source.generation,
+            lineage_depth,
             rights: requested_rights,
             active: true,
         };
@@ -582,15 +742,19 @@ impl IpcState {
     }
 
     fn allocate_generation(&mut self) -> u64 {
-        let generation = self.next_capability_generation.max(1);
         let max_generation = u64::MAX >> CAPABILITY_SLOT_BITS;
-        self.next_capability_generation = if generation >= max_generation {
-            1
-        } else {
-            generation + 1
-        };
-        self.last_capability_generation = generation;
-        generation
+        loop {
+            let generation = self.next_capability_generation.max(1);
+            self.next_capability_generation = if generation >= max_generation {
+                1
+            } else {
+                generation + 1
+            };
+            if find_capability_generation(&self.endpoints, generation).is_none() {
+                self.last_capability_generation = generation;
+                return generation;
+            }
+        }
     }
 
     fn record_denial(&mut self, stale: bool) {
@@ -688,6 +852,9 @@ impl IpcState {
             },
             target: capability.target,
             rights: capability.rights.bits(),
+            generation: capability.generation,
+            parent_generation: capability.parent_generation,
+            lineage_depth: capability.lineage_depth,
             active: capability.active,
         })
     }
@@ -752,6 +919,11 @@ impl IpcState {
             capability_transfer_failures: self.capability_transfer_failures,
             rights_attenuations: self.rights_attenuations,
             last_transferred_rights: self.last_transferred_rights,
+            revocation_trees: self.revocation_trees,
+            cascade_revocations: self.cascade_revocations,
+            descendant_revocations: self.descendant_revocations,
+            queued_capabilities_stripped: self.queued_capabilities_stripped,
+            last_revocation_size: self.last_revocation_size,
         }
     }
 
@@ -762,6 +934,7 @@ impl IpcState {
                 .iter()
                 .all(|endpoint| endpoint.len <= QUEUE_DEPTH && endpoint.head < QUEUE_DEPTH)
             && endpoint_owners_unique(&self.endpoints)
+            && capability_generations_unique(&self.endpoints)
             && capability_tables_valid(&self.endpoints)
             && queued_capabilities_valid(&self.endpoints)
     }
@@ -811,6 +984,10 @@ pub fn grant_capability(
 }
 
 pub fn revoke_capability(owner: u64, handle: u64) -> Result<(), IpcError> {
+    revoke_capability_tree(owner, handle).map(|_| ())
+}
+
+pub fn revoke_capability_tree(owner: u64, handle: u64) -> Result<RevocationReport, IpcError> {
     cpu_interrupts::without_interrupts(|| state_mut().revoke(owner, handle))
 }
 
@@ -967,6 +1144,7 @@ pub fn error_code(error: IpcError) -> u64 {
         IpcError::Cancelled => 17,
         IpcError::NotWaiting => 18,
         IpcError::RightsEscalation => 19,
+        IpcError::LineageDepthExceeded => 20,
     }
 }
 
@@ -991,6 +1169,7 @@ pub fn error_name(error: IpcError) -> &'static str {
         IpcError::Cancelled => "receive cancelled",
         IpcError::NotWaiting => "receiver is not waiting",
         IpcError::RightsEscalation => "capability rights escalation",
+        IpcError::LineageDepthExceeded => "capability lineage depth exceeded",
     }
 }
 
@@ -1034,6 +1213,7 @@ fn model_selftest() -> bool {
         && state.snapshot().active_endpoints == 0
         && state.invariants()
         && transfer_model_selftest()
+        && revocation_tree_model_selftest()
 }
 
 fn transfer_model_selftest() -> bool {
@@ -1127,6 +1307,147 @@ fn transfer_model_selftest() -> bool {
         && state.invariants()
 }
 
+fn revocation_tree_model_selftest() -> bool {
+    let mut state = IpcState::new();
+    state.init();
+    if state.register(1).is_err() || state.register(2).is_err() || state.register(3).is_err() {
+        return false;
+    }
+
+    let Ok(destination) = state.grant(1, 2, CapabilityRights::SEND) else {
+        return false;
+    };
+    let Ok(root) = state.grant(1, 3, CapabilityRights::SEND_CANCEL_DELEGATE) else {
+        return false;
+    };
+    if state
+        .send_with_capability(
+            1,
+            destination,
+            root,
+            CapabilityRights::SEND_DELEGATE,
+            b"child",
+        )
+        .is_err()
+    {
+        return false;
+    }
+    let mut output = [0u8; MAX_MESSAGE_BYTES];
+    let Ok(child_delivery) = state.receive(2, &mut output) else {
+        return false;
+    };
+    let child = child_delivery.capability_handle;
+    let Ok((_, _, _, grandchild)) =
+        state.send_with_capability(2, child, child, CapabilityRights::SEND, b"leaf")
+    else {
+        return false;
+    };
+    let Ok(cascade) = state.revoke(1, root) else {
+        return false;
+    };
+    let Ok(stripped_delivery) = state.receive(3, &mut output) else {
+        return false;
+    };
+    let queued_revoke_safe = cascade.revoked == 3
+        && cascade.descendants == 2
+        && cascade.queued_stripped == 1
+        && stripped_delivery.capability_handle == 0
+        && stripped_delivery.capability_rights == 0
+        && &output[..4] == b"leaf";
+    let descendants_stale = state.send_capability(2, child, b"stale")
+        == Err(IpcError::StaleCapability)
+        && state.send_capability(3, grandchild, b"stale") == Err(IpcError::StaleCapability);
+
+    let Ok(revoke_first) = state.grant(1, 3, CapabilityRights::SEND_DELEGATE) else {
+        return false;
+    };
+    let revoke_before_send = state.revoke(1, revoke_first).is_ok()
+        && state.send_with_capability(
+            1,
+            destination,
+            revoke_first,
+            CapabilityRights::SEND,
+            b"late",
+        ) == Err(IpcError::StaleCapability);
+
+    let Ok(receive_first_root) = state.grant(1, 3, CapabilityRights::SEND_DELEGATE) else {
+        return false;
+    };
+    if state
+        .send_with_capability(
+            1,
+            destination,
+            receive_first_root,
+            CapabilityRights::SEND,
+            b"early",
+        )
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(receive_first_delivery) = state.receive(2, &mut output) else {
+        return false;
+    };
+    let receive_first_child = receive_first_delivery.capability_handle;
+    let receive_before_revoke = state.revoke(1, receive_first_root).is_ok()
+        && state.send_capability(2, receive_first_child, b"stale")
+            == Err(IpcError::StaleCapability);
+
+    let Ok(cancel_root) = state.grant(1, 3, CapabilityRights::CANCEL_DELEGATE) else {
+        return false;
+    };
+    if state
+        .send_with_capability(
+            1,
+            destination,
+            cancel_root,
+            CapabilityRights::CANCEL,
+            b"cancel",
+        )
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(cancel_delivery) = state.receive(2, &mut output) else {
+        return false;
+    };
+    let cancel_child = cancel_delivery.capability_handle;
+    let revoke_before_cancel = state.revoke(1, cancel_root).is_ok()
+        && state.resolve(2, cancel_child, CapabilityRights::CANCEL)
+            == Err(IpcError::StaleCapability);
+
+    let Ok(self_root) = state.self_capability(1) else {
+        return false;
+    };
+    if state
+        .send_with_capability(1, destination, self_root, CapabilityRights::SEND, b"self")
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(self_child_delivery) = state.receive(2, &mut output) else {
+        return false;
+    };
+    let self_child = self_child_delivery.capability_handle;
+    let self_report = state.revoke(1, self_root);
+    let self_root_preserved = matches!(
+        self_report,
+        Ok(report) if report.revoked == 1 && report.descendants == 1
+    ) && state.self_capability(1) == Ok(self_root)
+        && state.send_capability(2, self_child, b"stale") == Err(IpcError::StaleCapability);
+
+    queued_revoke_safe
+        && descendants_stale
+        && revoke_before_send
+        && receive_before_revoke
+        && revoke_before_cancel
+        && self_root_preserved
+        && state.snapshot().cascade_revocations >= 4
+        && state.snapshot().descendant_revocations >= 5
+        && state.snapshot().queued_capabilities_stripped >= 1
+        && state.invariants()
+}
+
 fn endpoint_owners_unique(endpoints: &[Endpoint; MAX_ENDPOINTS]) -> bool {
     for left in 0..MAX_ENDPOINTS {
         let owner = endpoints[left].owner;
@@ -1159,6 +1480,8 @@ fn capability_tables_valid(endpoints: &[Endpoint; MAX_ENDPOINTS]) -> bool {
         if !self_capability.active
             || self_capability.target != endpoint.owner
             || self_capability.generation == 0
+            || self_capability.parent_generation != 0
+            || self_capability.lineage_depth != 0
             || !self_capability
                 .rights
                 .contains(CapabilityRights::SEND_RECEIVE)
@@ -1172,15 +1495,70 @@ fn capability_tables_valid(endpoints: &[Endpoint; MAX_ENDPOINTS]) -> bool {
             }
             if capability.generation == 0
                 || !capability.rights.valid()
+                || capability.lineage_depth > MAX_CAPABILITY_LINEAGE_DEPTH
                 || !endpoints
                     .iter()
                     .any(|target| target.owner == capability.target)
             {
                 return false;
             }
+            if capability.parent_generation == 0 {
+                if capability.lineage_depth != 0 {
+                    return false;
+                }
+                continue;
+            }
+            let Some(parent) = find_capability_generation(endpoints, capability.parent_generation)
+            else {
+                return false;
+            };
+            if parent.generation == capability.generation
+                || parent.target != capability.target
+                || !parent.rights.contains(CapabilityRights::DELEGATE)
+                || !parent.rights.contains(capability.rights)
+                || parent.lineage_depth.checked_add(1) != Some(capability.lineage_depth)
+            {
+                return false;
+            }
         }
     }
     true
+}
+
+fn capability_generations_unique(endpoints: &[Endpoint; MAX_ENDPOINTS]) -> bool {
+    for left_endpoint in 0..MAX_ENDPOINTS {
+        for left_slot in 0..MAX_CAPABILITIES_PER_ENDPOINT {
+            let left = endpoints[left_endpoint].capabilities[left_slot];
+            if !left.active {
+                continue;
+            }
+            for right_endpoint in left_endpoint..MAX_ENDPOINTS {
+                let first_slot = if right_endpoint == left_endpoint {
+                    left_slot + 1
+                } else {
+                    0
+                };
+                for right_slot in first_slot..MAX_CAPABILITIES_PER_ENDPOINT {
+                    let right = endpoints[right_endpoint].capabilities[right_slot];
+                    if right.active && right.generation == left.generation {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+fn find_capability_generation(
+    endpoints: &[Endpoint; MAX_ENDPOINTS],
+    generation: u64,
+) -> Option<Capability> {
+    endpoints
+        .iter()
+        .flat_map(|endpoint| endpoint.capabilities.iter())
+        .find(|capability| capability.active && capability.generation == generation)
+        .copied()
 }
 
 fn queued_capabilities_valid(endpoints: &[Endpoint; MAX_ENDPOINTS]) -> bool {

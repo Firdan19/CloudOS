@@ -20,7 +20,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 63] = [
+const COMMANDS: [Command; 64] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -270,6 +270,11 @@ const COMMANDS: [Command; 63] = [
         name: "capxfer",
         description: "uji transfer dan attenuasi capability",
         handler: command_capability_transfer,
+    },
+    Command {
+        name: "caprevoke",
+        description: "uji revocation tree capability",
+        handler: command_capability_revocation,
     },
     Command {
         name: "gdt",
@@ -2407,6 +2412,10 @@ fn command_ipc(_arguments: &[u8]) {
     print_counter("transfer failures", snapshot.capability_transfer_failures);
     print_counter("rights attenuated", snapshot.rights_attenuations);
     print_counter("last xfer rights", snapshot.last_transferred_rights);
+    print_counter("revoke trees", snapshot.revocation_trees);
+    print_counter("cascade revokes", snapshot.cascade_revocations);
+    print_counter("descendants", snapshot.descendant_revocations);
+    print_counter("queued stripped", snapshot.queued_capabilities_stripped);
     print_counter("blocking switches", scheduler_state.blocking_switches);
     print_counter("restart completions", process_state.ipc_restart_completions);
     print_counter("timeout wakeups", process_state.ipc_timeouts);
@@ -2467,6 +2476,15 @@ fn command_capabilities(_arguments: &[u8]) {
     print_counter("transfer failures", snapshot.capability_transfer_failures);
     print_counter("attenuations", snapshot.rights_attenuations);
     print_counter("last xfer rights", snapshot.last_transferred_rights);
+    print_counter(
+        "lineage max depth",
+        ipc::MAX_CAPABILITY_LINEAGE_DEPTH as u64,
+    );
+    print_counter("revocation trees", snapshot.revocation_trees);
+    print_counter("cascade revokes", snapshot.cascade_revocations);
+    print_counter("descendants", snapshot.descendant_revocations);
+    print_counter("queued stripped", snapshot.queued_capabilities_stripped);
+    print_counter("last revoke size", snapshot.last_revocation_size);
     print_counter("last generation", snapshot.last_capability_generation);
 
     for task_index in 0..process::MAX_TASKS {
@@ -2490,6 +2508,12 @@ fn command_capabilities(_arguments: &[u8]) {
             print_u64(capability.target);
             print(" rights=");
             print_hex_u64(capability.rights as u64);
+            print(" gen=");
+            print_u64(capability.generation);
+            print(" parent=");
+            print_u64(capability.parent_generation);
+            print(" depth=");
+            print_u64(capability.lineage_depth as u64);
             newline();
         }
     }
@@ -2619,6 +2643,70 @@ fn command_capability_transfer(_arguments: &[u8]) {
     print_counter("restart complete", report.restart_completions);
     print("  scheduler clean  : ");
     print_on_off(report.scheduler_clean);
+    newline();
+    print("  frame baseline   : ");
+    print_on_off(report.frame_baseline);
+    newline();
+    print("  heap baseline    : ");
+    print_on_off(report.heap_baseline);
+    newline();
+    print("  resource baseline: ");
+    print_on_off(report.resource_baseline);
+    newline();
+    print("  status           : ");
+    if report.passed {
+        println("PASS");
+    } else {
+        stats::inc_shell_error();
+        println("FAIL");
+    }
+}
+
+fn command_capability_revocation(_arguments: &[u8]) {
+    println("IPC capability revocation tree test:");
+    let report = process::run_capability_revocation_test();
+
+    print_counter("owner task", report.owner_id);
+    print_counter("middle task", report.middle_id);
+    print_counter("target task", report.target_id);
+    print("  chain created    : ");
+    print_on_off(report.chain_created);
+    newline();
+    print("  Ring 3 revoke    : ");
+    print_on_off(report.revocation_syscall);
+    newline();
+    print("  cascade revoked  : ");
+    print_on_off(report.cascade_revoked);
+    newline();
+    print("  queue sanitized  : ");
+    print_on_off(report.queued_attachment_stripped);
+    newline();
+    print("  message preserved: ");
+    print_on_off(report.message_preserved);
+    newline();
+    print("  descendants stale: ");
+    print_on_off(report.descendants_stale);
+    newline();
+    print("  revoke then send : ");
+    print_on_off(report.revoke_before_send);
+    newline();
+    print("  receive then revoke: ");
+    print_on_off(report.receive_before_revoke);
+    newline();
+    print("  cancel denied    : ");
+    print_on_off(report.cancel_after_revoke_denied);
+    newline();
+    print("  blocked preserved: ");
+    print_on_off(report.blocked_target_preserved);
+    newline();
+    print("  cleanup cascade  : ");
+    print_on_off(report.cleanup_cascade);
+    newline();
+    print("  scheduler clean  : ");
+    print_on_off(report.scheduler_clean);
+    newline();
+    print("  endpoint clean   : ");
+    print_on_off(report.endpoint_clean);
     newline();
     print("  frame baseline   : ");
     print_on_off(report.frame_baseline);
